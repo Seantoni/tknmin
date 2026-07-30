@@ -67,7 +67,7 @@ pub struct ClaudeCodeAdapter {
 
 impl ClaudeCodeAdapter {
     pub const ID: &'static str = "claude_code";
-    pub const VERSION: &'static str = "0.3.0";
+    pub const VERSION: &'static str = "0.4.0";
     /// Claude Code only calls Anthropic models; the transcripts name the model
     /// but never the provider.
     const PROVIDER: &'static str = "anthropic";
@@ -306,6 +306,13 @@ impl ClaudeCodeAdapter {
     /// the whole session is available — and dropping it would leave the session
     /// unaccounted for whenever it matters least to hide it.
     ///
+    /// The session window gets one further step. Because Claude Code only
+    /// rewrites the cache while it is running, an idle machine holds a session
+    /// `resets_at` that has already passed — and simply dropping it makes the
+    /// window disappear from the interface just as a whole fresh allowance
+    /// becomes available. The transcripts still hold the timeline, so it is
+    /// rebuilt from them; see [`ClaudeCodeAdapter::derived_session_window`].
+    ///
     /// When the cache is missing or entirely stale — a fresh install, or a
     /// version that does not write it — a live 429 transcript line still
     /// proves an allowance is exhausted, and that is used instead.
@@ -318,17 +325,123 @@ impl ClaudeCodeAdapter {
     /// The quota logic, with the clock as an argument so it can be tested
     /// without pinning fixtures to whatever today happens to be.
     fn quotas_at(&self, now: DateTime<Utc>) -> Vec<UsageQuota> {
-        let live: Vec<_> = self
-            .cached_utilization()
-            .unwrap_or_default()
-            .into_iter()
+        let cached = self.cached_utilization().unwrap_or_default();
+        let mut live: Vec<UsageQuota> = cached
+            .iter()
             .filter(|quota| quota.is_current_at(now))
+            .cloned()
             .collect();
+
+        // The session window is the one that expires while nobody is looking.
+        // Claude Code only rewrites its cache while it is running, so an idle
+        // machine keeps a `resets_at` that has long since passed — and the
+        // filter above quite correctly drops it, because that percentage
+        // describes a window that no longer exists.
+        //
+        // Dropping it entirely is what does the damage: the batch then stops
+        // reporting the window, `replace_quotas` deletes the stored row, and
+        // the session disappears from the interface at the exact moment a
+        // whole fresh allowance became available. The transcripts still know
+        // what happened, so they are asked instead.
+        if !live.iter().any(is_session_window) {
+            if let Some(derived) = cached
+                .iter()
+                .find(|quota| is_session_window(quota))
+                .and_then(|expired| self.derived_session_window(expired, now))
+            {
+                // Ahead of the week that contains it, matching the order
+                // `cached_utilization` produces and the interface expects.
+                live.insert(0, derived);
+            }
+        }
+
         if !live.is_empty() {
             return live;
         }
 
         self.limit_hit_quota(now).into_iter().collect()
+    }
+
+    /// The session window as the transcripts describe it, once the cache's own
+    /// has expired.
+    ///
+    /// Only the *percentage* died with the old window. Its `resets_at` is still
+    /// a fact — the instant that window ended — and from there the timeline is
+    /// fully derivable locally, because a rolling window opens on the first
+    /// request after a reset and then runs its full length whether or not the
+    /// work continues. Message timestamps are exact and, unlike the cache, do
+    /// not need another process to be running to stay true.
+    ///
+    /// The result always reports zero used. That is not a guess: a rolling
+    /// window genuinely opens empty, and it is the honest confirmed value for
+    /// the instant it opened. What has been spent into it since is the
+    /// projection layer's business, from records this adapter cannot see.
+    fn derived_session_window(
+        &self,
+        expired: &UsageQuota,
+        now: DateTime<Utc>,
+    ) -> Option<UsageQuota> {
+        let ended_at = expired.resets_at?;
+        let window = chrono::Duration::minutes(i64::from(SESSION_WINDOW_MINUTES));
+
+        let mut times = self.activity_since(ended_at);
+        times.sort_unstable();
+
+        // Windows tile forward from the end of the expired one. Walking rather
+        // than dividing is what keeps a long idle gap honest: a window only
+        // exists if a request actually opened it.
+        let Some(&first) = times.first() else {
+            return Some(idle_session(expired.observed_at));
+        };
+        let mut anchor = first;
+        while anchor + window <= now {
+            match times.iter().find(|at| **at >= anchor + window) {
+                Some(next) => anchor = *next,
+                None => return Some(idle_session(now)),
+            }
+        }
+
+        Some(UsageQuota {
+            source_app: SourceApp::ClaudeCode,
+            label: None,
+            window_minutes: SESSION_WINDOW_MINUTES,
+            used_percent_tenths: 0,
+            resets_at: Some(anchor + window),
+            // Zero used was true when the window opened, not now.
+            observed_at: anchor,
+        })
+    }
+
+    /// Message timestamps at or after `since`, from the freshest transcripts.
+    ///
+    /// Scanned as text rather than parsed as JSON: only the timestamp is
+    /// wanted, every line carries one in the same shape, and this runs on the
+    /// quota lane once a minute.
+    fn activity_since(&self, since: DateTime<Utc>) -> Vec<DateTime<Utc>> {
+        let mut files = self.transcript_files();
+        files.sort_by_key(|path| fs::metadata(path).and_then(|meta| meta.modified()).ok());
+
+        let mut times = Vec::new();
+        for path in files.iter().rev().take(FRESHEST_FILES_FOR_QUOTA) {
+            // A file untouched since before the cutoff cannot hold a message
+            // after it, and reading it would be pure cost.
+            let untouched = fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| DateTime::<Utc>::from(modified) < since);
+            if untouched {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(path) else {
+                continue;
+            };
+            times.extend(
+                content
+                    .lines()
+                    .filter_map(line_timestamp)
+                    .filter(|at| *at >= since),
+            );
+        }
+        times
     }
 
     /// Every window in `~/.claude.json`'s `cachedUsageUtilization`, unfiltered.
@@ -472,6 +585,41 @@ fn parse_transcript(
 
 const SESSION_WINDOW_MINUTES: u32 = 300;
 const WEEK_WINDOW_MINUTES: u32 = 10_080;
+
+/// The rolling session pool, as opposed to the week or a per-model cap. Length
+/// alone is not enough — the per-model caps share the week's — but for the
+/// session the pairing of length and no label is unambiguous.
+fn is_session_window(quota: &UsageQuota) -> bool {
+    quota.window_minutes == SESSION_WINDOW_MINUTES && quota.label.is_none()
+}
+
+/// No session window running: the whole allowance is available and there is no
+/// reset to count down to. The same shape Claude Code itself writes between
+/// sessions, so nothing downstream has to learn a second way to say it.
+///
+/// `observed_at` is inherited from the cache this was derived against rather
+/// than set to now. `read_delta` reports the newest observation as the whole
+/// source's freshness, and stamping a derived row with the current time would
+/// have the interface claim Claude Code had just spoken when in fact its
+/// percentages are hours old.
+fn idle_session(observed_at: DateTime<Utc>) -> UsageQuota {
+    UsageQuota {
+        source_app: SourceApp::ClaudeCode,
+        label: None,
+        window_minutes: SESSION_WINDOW_MINUTES,
+        used_percent_tenths: 0,
+        resets_at: None,
+        observed_at,
+    }
+}
+
+/// The `timestamp` field of one transcript line, without parsing the rest.
+fn line_timestamp(line: &str) -> Option<DateTime<Utc>> {
+    const KEY: &str = r#""timestamp":""#;
+    let rest = &line[line.find(KEY)? + KEY.len()..];
+    let raw = &rest[..rest.find('"')?];
+    DateTime::parse_from_rfc3339(raw).ok().map(|at| at.to_utc())
+}
 
 /// The cache states percentages as JSON numbers (`51`, `85.575`). This is the
 /// one place a float is allowed in, and it converts straight to the integer
@@ -1022,26 +1170,158 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn a_window_past_its_reset_is_dropped() {
-        let dir = std::env::temp_dir().join(format!("tokens-claude-stale-{}", std::process::id()));
-        let config = config_json(
-            1_785_359_289_614,
-            "2026-07-29T23:50:00.308400+00:00",
-            "2026-07-31T23:00:00.308427+00:00",
-        );
-        let adapter = adapter_with_config(&dir, &config);
+    /// A transcript holding nothing but message timestamps, which is all the
+    /// session timeline is derived from.
+    fn write_transcript(dir: &std::path::Path, name: &str, timestamps: &[&str]) {
+        let project = dir.join("projects").join("-Users-dev-project");
+        fs::create_dir_all(&project).unwrap();
+        let body: String = timestamps
+            .iter()
+            .map(|at| format!("{{\"type\":\"assistant\",\"timestamp\":\"{at}\"}}\n"))
+            .collect();
+        fs::write(project.join(name), body).unwrap();
+    }
 
-        // An hour after the session window rolled over, but inside the week:
-        // the 51% describes a window that no longer exists.
-        let after_session = DateTime::parse_from_rfc3339("2026-07-30T01:00:00Z")
-            .unwrap()
-            .to_utc();
-        let quotas = adapter.quotas_at(after_session);
-        assert_eq!(quotas.len(), 1);
-        assert_eq!(quotas[0].window_minutes, 10_080);
+    /// The standard fixture: session reset 2026-07-29T23:50, week two days on.
+    fn expired_session_adapter(dir: &std::path::Path) -> ClaudeCodeAdapter {
+        adapter_with_config(
+            dir,
+            &config_json(
+                1_785_359_289_614,
+                "2026-07-29T23:50:00.308400+00:00",
+                "2026-07-31T23:00:00.308427+00:00",
+            ),
+        )
+    }
+
+    fn instant(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw).unwrap().to_utc()
+    }
+
+    #[test]
+    fn an_expired_percentage_is_dropped_but_the_window_is_not() {
+        let dir = std::env::temp_dir().join(format!("tokens-claude-stale-{}", std::process::id()));
+        let adapter = expired_session_adapter(&dir);
+
+        // An hour after the session window rolled over, with nothing done
+        // since: the cached 51% describes a window that no longer exists, but
+        // the session itself is whole and must still be reported.
+        let quotas = adapter.quotas_at(instant("2026-07-30T01:00:00Z"));
+        assert_eq!(quotas.len(), 2);
+
+        let session = &quotas[0];
+        assert!(is_session_window(session));
+        assert_eq!(session.used_percent_tenths, 0);
+        assert_eq!(session.resets_at, None);
+        assert_eq!(quotas[1].window_minutes, 10_080);
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_first_request_after_a_reset_opens_the_next_window() {
+        let dir = std::env::temp_dir().join(format!("tokens-claude-reopen-{}", std::process::id()));
+        let adapter = expired_session_adapter(&dir);
+        // Twenty minutes after the old window ended.
+        write_transcript(&dir, "s1.jsonl", &["2026-07-30T00:10:00.000Z"]);
+
+        let quotas = adapter.quotas_at(instant("2026-07-30T01:00:00Z"));
+        let session = &quotas[0];
+        assert!(is_session_window(session));
+        // Five hours from that first request, not from the old reset and not
+        // from now.
+        assert_eq!(session.resets_at, Some(instant("2026-07-30T05:10:00Z")));
+        // A rolling window opens empty, and that was true when it opened.
+        assert_eq!(session.used_percent_tenths, 0);
+        assert_eq!(session.observed_at, instant("2026-07-30T00:10:00Z"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn windows_tile_forward_across_a_long_days_work() {
+        let dir = std::env::temp_dir().join(format!("tokens-claude-tile-{}", std::process::id()));
+        let adapter = expired_session_adapter(&dir);
+        // A window opens at 00:10 and ends at 05:10; the 05:30 request opens
+        // the next one. The 02:00 message falls inside the first and starts
+        // nothing.
+        write_transcript(
+            &dir,
+            "s1.jsonl",
+            &[
+                "2026-07-30T00:10:00.000Z",
+                "2026-07-30T02:00:00.000Z",
+                "2026-07-30T05:30:00.000Z",
+            ],
+        );
+
+        let quotas = adapter.quotas_at(instant("2026-07-30T06:00:00Z"));
+        assert_eq!(quotas[0].resets_at, Some(instant("2026-07-30T10:30:00Z")));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_window_that_ran_out_while_idle_reports_no_window_at_all() {
+        let dir = std::env::temp_dir().join(format!("tokens-claude-idled-{}", std::process::id()));
+        let adapter = expired_session_adapter(&dir);
+        // One request, then the machine went quiet for hours. The window it
+        // opened has itself expired, and nothing opened another.
+        write_transcript(&dir, "s1.jsonl", &["2026-07-30T00:10:00.000Z"]);
+
+        let quotas = adapter.quotas_at(instant("2026-07-30T08:00:00Z"));
+        assert!(is_session_window(&quotas[0]));
+        assert_eq!(quotas[0].resets_at, None);
+        assert_eq!(quotas[0].used_percent_tenths, 0);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_live_cached_session_is_never_second_guessed() {
+        let dir = std::env::temp_dir().join(format!("tokens-claude-live-{}", std::process::id()));
+        let adapter = expired_session_adapter(&dir);
+        write_transcript(&dir, "s1.jsonl", &["2026-07-29T22:00:00.000Z"]);
+
+        // Before the cached reset: the source's own percentage stands, and no
+        // derivation happens.
+        let quotas = adapter.quotas_at(instant("2026-07-29T23:00:00Z"));
+        assert_eq!(quotas.len(), 2);
+        assert_eq!(quotas[0].used_percent_tenths, 510);
+        assert_eq!(
+            quotas[0].resets_at,
+            Some(instant("2026-07-29T23:50:00.308400Z"))
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_derived_window_does_not_claim_the_source_just_spoke() {
+        let dir = std::env::temp_dir().join(format!("tokens-claude-fresh-{}", std::process::id()));
+        let adapter = expired_session_adapter(&dir);
+
+        // Hours after the cached session window ended, with nothing since.
+        let quotas = adapter.quotas_at(instant("2026-07-30T08:00:00Z"));
+        // The derived row inherits the cache's own stamp. `read_delta` reports
+        // the newest observation as the source's freshness, so stamping this
+        // with the current time would have the interface claim Claude Code had
+        // just spoken while its percentages are hours old.
+        let newest = quotas.iter().map(|quota| quota.observed_at).max().unwrap();
+        assert_eq!(newest, instant("2026-07-29T21:08:09.614Z"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_timestamp_is_read_without_parsing_the_line_around_it() {
+        assert_eq!(
+            line_timestamp(r#"{"type":"assistant","timestamp":"2026-07-30T00:10:00.000Z","x":1}"#),
+            Some(instant("2026-07-30T00:10:00Z"))
+        );
+        assert_eq!(line_timestamp(r#"{"type":"summary"}"#), None);
+        assert_eq!(line_timestamp(r#"{"timestamp":"not a time"}"#), None);
+        assert_eq!(line_timestamp("not json at all"), None);
     }
 
     #[test]
