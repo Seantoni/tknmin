@@ -40,7 +40,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::pace::QuotaSample;
-use super::quota::UsageQuota;
+use super::quota::{same_window_instance, UsageQuota};
 use super::record::UsageRecord;
 use super::source::SourceApp;
 
@@ -263,7 +263,7 @@ fn fit_window(
     let mut rates: Vec<u64> = Vec::new();
     for pair in window.windows(2) {
         let (left, right) = (pair[0], pair[1]);
-        if left.resets_at != right.resets_at {
+        if !same_window_instance(left.resets_at, right.resets_at) {
             continue;
         }
         let moved = right

@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use super::baseline::{
     pace_vs_baseline, PaceVsBaseline, SourceBaseline, TokenRate, RATE_WINDOW_MINUTES,
 };
-use super::quota::UsageQuota;
+use super::quota::{same_window_instance, UsageQuota};
 use super::source::SourceApp;
 
 /// A pace measurement coarser than this carries so much relative error from
@@ -386,8 +386,10 @@ fn trailing_runway(
                 && sample.window_minutes == right.window_minutes
                 // Deltas never span two window instances: a reset drops the
                 // used figure to zero, and differencing across it invents a
-                // large negative pace.
-                && sample.resets_at == right.resets_at
+                // large negative pace. Compared with a tolerance, because the
+                // source restates the same reset with a little jitter and an
+                // exact match would discard every pair it has.
+                && same_window_instance(sample.resets_at, right.resets_at)
                 && sample.observed_at >= horizon_start
                 && sample.observed_at < right.observed_at
         })

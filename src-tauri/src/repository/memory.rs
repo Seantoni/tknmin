@@ -11,8 +11,9 @@ use std::sync::RwLock;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    QuotaSample, RecentQuery, RepositoryRevision, SourceApp, SourceCheckpoint, SourceSyncHealth,
-    SummaryQuery, UsageQuota, UsageRecord, UsageSummary, WindowPace,
+    same_window_instance, QuotaSample, RecentQuery, RepositoryRevision, SourceApp,
+    SourceCheckpoint, SourceSyncHealth, SummaryQuery, UsageQuota, UsageRecord, UsageSummary,
+    WindowPace,
 };
 
 use super::summarize;
@@ -225,7 +226,7 @@ impl UsageWriter for InMemoryUsageRepository {
                     })
                     .is_none_or(|sample| {
                         sample.used_percent_tenths != incoming.used_percent_tenths
-                            || sample.resets_at != incoming.resets_at
+                            || !same_window_instance(sample.resets_at, incoming.resets_at)
                     });
                 if moved {
                     store.quota_samples.push(QuotaSample {

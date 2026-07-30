@@ -35,7 +35,7 @@ pub use projection::{
     QuotaProjection,
 };
 pub use quality::{CostCalculationStatus, FieldQuality, TimestampInterpretation};
-pub use quota::UsageQuota;
+pub use quota::{same_window_instance, UsageQuota};
 pub use record::{
     CostInfo, DisplayTotal, SourceProvenance, TotalRule, UsageRecord, NORMALIZATION_VERSION,
 };

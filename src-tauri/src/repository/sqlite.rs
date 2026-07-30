@@ -22,8 +22,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::domain::{
-    QuotaSample, RecentQuery, RepositoryRevision, SourceApp, SourceCheckpoint, SourceSyncHealth,
-    SummaryQuery, SyncState, UsageQuota, UsageRecord, UsageSummary, WindowPace,
+    same_window_instance, QuotaSample, RecentQuery, RepositoryRevision, SourceApp,
+    SourceCheckpoint, SourceSyncHealth, SummaryQuery, SyncState, UsageQuota, UsageRecord,
+    UsageSummary, WindowPace,
 };
 
 use super::summarize;
@@ -547,7 +548,13 @@ fn apply(
             .optional()?;
         let moved = last.is_none_or(|(used, resets)| {
             used != i64::from(incoming.used_percent_tenths)
-                || resets != incoming.resets_at.map(|at| at.timestamp_millis())
+                // A restated reset jitters by a second or so. Compared
+                // exactly it looks like a new window on every poll, and the
+                // table fills with rows that record nothing.
+                || !same_window_instance(
+                    resets.and_then(|at| DateTime::from_timestamp_millis(at)),
+                    incoming.resets_at,
+                )
         });
         if moved {
             transaction.execute(
