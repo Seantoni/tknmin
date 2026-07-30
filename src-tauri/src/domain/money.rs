@@ -36,12 +36,20 @@ pub struct Money {
 impl Money {
     pub const MAX_EXPONENT: u8 = 6;
 
-    pub fn new(amount_minor: i64, currency: &str, minor_unit_exponent: u8) -> Result<Self, MoneyError> {
+    pub fn new(
+        amount_minor: i64,
+        currency: &str,
+        minor_unit_exponent: u8,
+    ) -> Result<Self, MoneyError> {
         let currency = normalize_currency(currency)?;
         if minor_unit_exponent > Self::MAX_EXPONENT {
             return Err(MoneyError::InvalidExponent(minor_unit_exponent));
         }
-        Ok(Self { amount_minor, currency, minor_unit_exponent })
+        Ok(Self {
+            amount_minor,
+            currency,
+            minor_unit_exponent,
+        })
     }
 
     /// Re-express the amount at a finer scale so two values can be combined.
@@ -55,8 +63,15 @@ impl Money {
         }
         let steps = u32::from(exponent - self.minor_unit_exponent);
         let factor = 10i64.checked_pow(steps).ok_or(MoneyError::Overflow)?;
-        let amount_minor = self.amount_minor.checked_mul(factor).ok_or(MoneyError::Overflow)?;
-        Ok(Self { amount_minor, currency: self.currency.clone(), minor_unit_exponent: exponent })
+        let amount_minor = self
+            .amount_minor
+            .checked_mul(factor)
+            .ok_or(MoneyError::Overflow)?;
+        Ok(Self {
+            amount_minor,
+            currency: self.currency.clone(),
+            minor_unit_exponent: exponent,
+        })
     }
 
     /// Add two amounts of the same currency, aligning their scales first.
@@ -70,8 +85,15 @@ impl Money {
         let exponent = self.minor_unit_exponent.max(other.minor_unit_exponent);
         let left = self.rescaled(exponent)?;
         let right = other.rescaled(exponent)?;
-        let amount_minor = left.amount_minor.checked_add(right.amount_minor).ok_or(MoneyError::Overflow)?;
-        Ok(Money { amount_minor, currency: left.currency, minor_unit_exponent: exponent })
+        let amount_minor = left
+            .amount_minor
+            .checked_add(right.amount_minor)
+            .ok_or(MoneyError::Overflow)?;
+        Ok(Money {
+            amount_minor,
+            currency: left.currency,
+            minor_unit_exponent: exponent,
+        })
     }
 }
 
@@ -106,8 +128,14 @@ mod tests {
     #[test]
     fn uppercases_and_validates_currency() {
         assert_eq!(Money::new(125, "usd", 2).unwrap().currency, "USD");
-        assert!(matches!(Money::new(1, "US", 2), Err(MoneyError::InvalidCurrency(_))));
-        assert!(matches!(Money::new(1, "US1", 2), Err(MoneyError::InvalidCurrency(_))));
+        assert!(matches!(
+            Money::new(1, "US", 2),
+            Err(MoneyError::InvalidCurrency(_))
+        ));
+        assert!(matches!(
+            Money::new(1, "US1", 2),
+            Err(MoneyError::InvalidCurrency(_))
+        ));
     }
 
     #[test]
@@ -122,7 +150,10 @@ mod tests {
     fn refuses_to_mix_currencies() {
         let usd = Money::new(1, "USD", 2).unwrap();
         let eur = Money::new(1, "EUR", 2).unwrap();
-        assert!(matches!(usd.checked_add(&eur), Err(MoneyError::MismatchedCurrency { .. })));
+        assert!(matches!(
+            usd.checked_add(&eur),
+            Err(MoneyError::MismatchedCurrency { .. })
+        ));
     }
 
     #[test]

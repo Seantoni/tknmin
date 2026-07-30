@@ -1,54 +1,51 @@
 //! The import pipeline.
 //!
-//! Joins the stages the plan specifies:
+//! One stage of the chain the plan specifies:
 //!
 //! ```text
-//! discovery → source adapter → UsageRecordDraft → normalizer/validator
-//!           → repository → Tauri command → React
+//! coordinator → source adapter → UsageRecordDraft → normalizer/validator
+//!             → repository transaction → committed revision → React
 //! ```
 //!
-//! Only the middle of that chain lives here. Discovery and parsing belong to
-//! the adapters; presentation belongs to React.
+//! Only the normalizing middle lives here. Reading belongs to the adapters,
+//! *when* to read and *when* to commit belongs to `crate::refresh`, and
+//! presentation belongs to React. In particular this module no longer touches
+//! the repository: writing is a transaction the coordinator assembles, so a
+//! batch of records can commit together with the checkpoint that accounts for
+//! them.
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::UsageRecordDraft;
+use crate::domain::{UsageRecord, UsageRecordDraft};
 use crate::normalize::{self, RejectedDraft};
-use crate::repository::{RepositoryError, UsageRepository};
 
-/// The outcome of one import, reported to the interface in full: partial
+/// The outcome of normalizing one source's delta, reported in full: partial
 /// success is the expected case when a log contains entries this version
 /// cannot make sense of.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ImportReport {
-    pub inserted: usize,
-    pub duplicates_skipped: usize,
+pub struct NormalizeReport {
+    pub accepted: usize,
     pub rejected: Vec<RejectedDraft>,
 }
 
-impl ImportReport {
+impl NormalizeReport {
     pub fn rejected_count(&self) -> usize {
         self.rejected.len()
     }
 }
 
-/// Normalize drafts and store whatever passes validation.
+/// Validate drafts, keeping what passes and reporting what does not.
 ///
 /// Rejected drafts are reported, not raised: one malformed entry must never
 /// discard the entries around it.
-pub fn import_drafts(
-    repository: &dyn UsageRepository,
-    drafts: Vec<UsageRecordDraft>,
-) -> Result<ImportReport, RepositoryError> {
+pub fn normalize_drafts(drafts: Vec<UsageRecordDraft>) -> (Vec<UsageRecord>, NormalizeReport) {
     let batch = normalize::normalize_batch(drafts);
-    let stored = repository.insert_batch(batch.records)?;
-
-    Ok(ImportReport {
-        inserted: stored.inserted,
-        duplicates_skipped: stored.duplicates_skipped,
+    let report = NormalizeReport {
+        accepted: batch.records.len(),
         rejected: batch.rejected,
-    })
+    };
+    (batch.records, report)
 }
 
 #[cfg(test)]
@@ -57,7 +54,6 @@ mod tests {
     use crate::domain::{
         FieldQuality, SourceApp, SourceProvenance, TokenCounts, TokenField, UsageRecordDraft,
     };
-    use crate::repository::InMemoryUsageRepository;
 
     fn draft(timestamp: &str) -> UsageRecordDraft {
         UsageRecordDraft::new(
@@ -69,36 +65,44 @@ mod tests {
             },
         )
         .with_raw_timestamp(timestamp)
-        .with_tokens(TokenCounts { input: TokenField::exact(10), ..TokenCounts::default() })
+        .with_tokens(TokenCounts {
+            input: TokenField::exact(10),
+            ..TokenCounts::default()
+        })
     }
 
     #[test]
-    fn stores_valid_drafts_and_reports_the_rest() {
-        let repository = InMemoryUsageRepository::new();
+    fn keeps_valid_drafts_and_reports_the_rest() {
         let mut malformed = draft("2026-07-29T10:00:00Z");
-        malformed.tokens.output = TokenField { value: None, quality: FieldQuality::Exact };
+        malformed.tokens.output = TokenField {
+            value: None,
+            quality: FieldQuality::Exact,
+        };
 
-        let report = import_drafts(
-            &repository,
-            vec![draft("2026-07-29T10:00:00Z"), malformed, draft("2026-07-29T11:00:00Z")],
-        )
-        .unwrap();
+        let (records, report) = normalize_drafts(vec![
+            draft("2026-07-29T10:00:00Z"),
+            malformed,
+            draft("2026-07-29T11:00:00Z"),
+        ]);
 
-        assert_eq!(report.inserted, 2);
+        assert_eq!(records.len(), 2);
+        assert_eq!(report.accepted, 2);
         assert_eq!(report.rejected_count(), 1);
-        assert_eq!(repository.count().unwrap(), 2);
     }
 
     #[test]
-    fn re_importing_the_same_drafts_changes_nothing() {
-        let repository = InMemoryUsageRepository::new();
+    fn the_same_drafts_normalize_to_the_same_identities() {
         let drafts = || vec![draft("2026-07-29T10:00:00Z"), draft("2026-07-29T11:00:00Z")];
+        let keys = |records: Vec<crate::domain::UsageRecord>| {
+            records
+                .into_iter()
+                .map(|record| record.dedupe_key)
+                .collect::<Vec<_>>()
+        };
 
-        import_drafts(&repository, drafts()).unwrap();
-        let second = import_drafts(&repository, drafts()).unwrap();
-
-        assert_eq!(second.inserted, 0);
-        assert_eq!(second.duplicates_skipped, 2);
-        assert_eq!(repository.count().unwrap(), 2);
+        assert_eq!(
+            keys(normalize_drafts(drafts()).0),
+            keys(normalize_drafts(drafts()).0)
+        );
     }
 }

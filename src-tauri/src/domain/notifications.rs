@@ -55,7 +55,10 @@ impl ThresholdAlert {
         match self.metric {
             ThresholdMetric::RemainingPercent => {
                 let left = format_tenths(self.remaining_percent_tenths);
-                format!("{left}% left {window} · threshold {threshold}%", threshold = self.threshold_value)
+                format!(
+                    "{left}% left {window} · threshold {threshold}%",
+                    threshold = self.threshold_value
+                )
             }
             ThresholdMetric::MinutesUntilReset => {
                 format!(
@@ -93,7 +96,10 @@ pub fn evaluate_alerts(
             continue;
         }
 
-        let minutes_until_reset = minutes_until(quota.resets_at, now);
+        let Some(resets_at) = quota.resets_at else {
+            continue;
+        };
+        let minutes_until_reset = minutes_until(resets_at, now);
         let alert = ThresholdAlert {
             source_app: quota.source_app,
             window_minutes: quota.window_minutes,
@@ -101,7 +107,7 @@ pub fn evaluate_alerts(
             threshold_value: threshold.value,
             remaining_percent_tenths: quota.remaining_percent_tenths(),
             minutes_until_reset,
-            resets_at: quota.resets_at,
+            resets_at,
             observed_at: quota.observed_at,
             dedupe_key: dedupe_key(threshold, quota),
         };
@@ -125,9 +131,14 @@ fn relevant_quota<'a>(
     quotas: &'a [UsageQuota],
     now: DateTime<Utc>,
 ) -> Option<&'a UsageQuota> {
+    // A window that has not started cannot be warned about: nothing of it is
+    // used, and there is no reset to count down to.
     let live: Vec<&UsageQuota> = quotas
         .iter()
-        .filter(|quota| quota.source_app == threshold.source_app && quota.resets_at > now)
+        .filter(|quota| {
+            quota.source_app == threshold.source_app
+                && quota.resets_at.is_some_and(|resets_at| resets_at > now)
+        })
         .collect();
     if live.is_empty() {
         return None;
@@ -137,25 +148,19 @@ fn relevant_quota<'a>(
         ThresholdMetric::RemainingPercent => live
             .into_iter()
             .min_by_key(|quota| quota.remaining_percent_tenths()),
-        ThresholdMetric::MinutesUntilReset => {
-            live.into_iter().min_by_key(|quota| quota.resets_at)
-        }
+        ThresholdMetric::MinutesUntilReset => live.into_iter().min_by_key(|quota| quota.resets_at),
     }
 }
 
-fn crosses_threshold(
-    threshold: &SourceThreshold,
-    quota: &UsageQuota,
-    now: DateTime<Utc>,
-) -> bool {
+fn crosses_threshold(threshold: &SourceThreshold, quota: &UsageQuota, now: DateTime<Utc>) -> bool {
     match threshold.metric {
         ThresholdMetric::RemainingPercent => {
             let remaining_whole = u32::from(quota.remaining_percent_tenths() / 10);
             remaining_whole <= threshold.value
         }
-        ThresholdMetric::MinutesUntilReset => {
-            minutes_until(quota.resets_at, now) <= threshold.value
-        }
+        ThresholdMetric::MinutesUntilReset => quota
+            .resets_at
+            .is_some_and(|resets_at| minutes_until(resets_at, now) <= threshold.value),
     }
 }
 
@@ -174,7 +179,7 @@ fn dedupe_key(threshold: &SourceThreshold, quota: &UsageQuota) -> String {
         quota.window_minutes,
         threshold.metric,
         threshold.value,
-        quota.resets_at.timestamp()
+        quota.resets_at.map_or(0, |resets_at| resets_at.timestamp())
     )
 }
 
@@ -202,13 +207,18 @@ mod tests {
     use crate::domain::{SourceThreshold, ThresholdMetric};
     use chrono::TimeZone;
 
-    fn quota(source: SourceApp, window: u32, used_tenths: u16, resets_at: DateTime<Utc>) -> UsageQuota {
+    fn quota(
+        source: SourceApp,
+        window: u32,
+        used_tenths: u16,
+        resets_at: DateTime<Utc>,
+    ) -> UsageQuota {
         UsageQuota {
             source_app: source,
             label: None,
             window_minutes: window,
             used_percent_tenths: used_tenths,
-            resets_at,
+            resets_at: Some(resets_at),
             observed_at: resets_at - chrono::Duration::minutes(5),
         }
     }
@@ -238,6 +248,7 @@ mod tests {
                     value: 25,
                 },
             ],
+            ..AppOptions::defaults()
         };
         let quotas = vec![quota(SourceApp::ClaudeCode, 300, 800, resets)]; // 20% left
         let alerts = evaluate_alerts(&options, &quotas, now, &Default::default());
@@ -259,6 +270,7 @@ mod tests {
                     value: 25,
                 })
                 .collect(),
+            ..AppOptions::defaults()
         };
         let quotas = vec![quota(SourceApp::Codex, 10_080, 500, resets)]; // 50% left
         assert!(evaluate_alerts(&options, &quotas, now, &Default::default()).is_empty());
@@ -278,6 +290,7 @@ mod tests {
                     value: 60,
                 })
                 .collect(),
+            ..AppOptions::defaults()
         };
         let quotas = vec![quota(SourceApp::ClaudeCode, 300, 100, resets)];
         let alerts = evaluate_alerts(&options, &quotas, now, &Default::default());
@@ -299,6 +312,7 @@ mod tests {
                     value: 50,
                 })
                 .collect(),
+            ..AppOptions::defaults()
         };
         let quotas = vec![quota(SourceApp::Cursor, 10_080, 900, resets)];
         let open = evaluate_alerts(&options, &quotas, now, &Default::default());
@@ -321,10 +335,21 @@ mod tests {
                     value: 30,
                 })
                 .collect(),
+            ..AppOptions::defaults()
         };
         let quotas = vec![
-            quota(SourceApp::ClaudeCode, 10_080, 200, now + chrono::Duration::days(3)), // 80% left
-            quota(SourceApp::ClaudeCode, 300, 850, now + chrono::Duration::hours(2)), // 15% left
+            quota(
+                SourceApp::ClaudeCode,
+                10_080,
+                200,
+                now + chrono::Duration::days(3),
+            ), // 80% left
+            quota(
+                SourceApp::ClaudeCode,
+                300,
+                850,
+                now + chrono::Duration::hours(2),
+            ), // 15% left
         ];
         let alerts = evaluate_alerts(&options, &quotas, now, &Default::default());
         assert_eq!(alerts.len(), 1);

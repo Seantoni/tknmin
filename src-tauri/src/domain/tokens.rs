@@ -20,19 +20,31 @@ pub struct TokenField {
 
 impl TokenField {
     pub const fn unknown() -> Self {
-        Self { value: None, quality: FieldQuality::Unknown }
+        Self {
+            value: None,
+            quality: FieldQuality::Unknown,
+        }
     }
 
     pub const fn exact(value: u64) -> Self {
-        Self { value: Some(value), quality: FieldQuality::Exact }
+        Self {
+            value: Some(value),
+            quality: FieldQuality::Exact,
+        }
     }
 
     pub const fn estimated(value: u64) -> Self {
-        Self { value: Some(value), quality: FieldQuality::Estimated }
+        Self {
+            value: Some(value),
+            quality: FieldQuality::Estimated,
+        }
     }
 
     pub const fn partial(value: u64) -> Self {
-        Self { value: Some(value), quality: FieldQuality::Partial }
+        Self {
+            value: Some(value),
+            quality: FieldQuality::Partial,
+        }
     }
 
     /// The value only when it is meaningful to sum.
@@ -92,7 +104,10 @@ mod tests {
 
     #[test]
     fn detects_inconsistent_quality() {
-        let bad = TokenField { value: None, quality: FieldQuality::Exact };
+        let bad = TokenField {
+            value: None,
+            quality: FieldQuality::Exact,
+        };
         assert!(!bad.has_consistent_quality());
         assert!(TokenField::unknown().has_consistent_quality());
         assert!(TokenField::exact(1).has_consistent_quality());

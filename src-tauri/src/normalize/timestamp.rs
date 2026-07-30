@@ -20,7 +20,9 @@ const NAIVE_FORMATS: [&str; 4] = [
 /// must normalize identically regardless of where or when it is imported. An
 /// adapter that knows its source writes local time can convert the value
 /// itself and report [`TimestampInterpretation::AssumedLocal`].
-pub fn parse_source_timestamp(raw: Option<&str>) -> (Option<DateTime<Utc>>, TimestampInterpretation) {
+pub fn parse_source_timestamp(
+    raw: Option<&str>,
+) -> (Option<DateTime<Utc>>, TimestampInterpretation) {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return (None, TimestampInterpretation::Missing);
     };
@@ -30,18 +32,27 @@ pub fn parse_source_timestamp(raw: Option<&str>) -> (Option<DateTime<Utc>>, Time
     }
 
     if let Ok(parsed) = DateTime::parse_from_rfc3339(raw) {
-        return (Some(parsed.with_timezone(&Utc)), TimestampInterpretation::ExplicitOffset);
+        return (
+            Some(parsed.with_timezone(&Utc)),
+            TimestampInterpretation::ExplicitOffset,
+        );
     }
 
     for format in NAIVE_FORMATS {
         if let Ok(naive) = NaiveDateTime::parse_from_str(raw, format) {
-            return (Some(Utc.from_utc_datetime(&naive)), TimestampInterpretation::AssumedUtc);
+            return (
+                Some(Utc.from_utc_datetime(&naive)),
+                TimestampInterpretation::AssumedUtc,
+            );
         }
     }
 
     if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
         let naive = date.and_hms_opt(0, 0, 0).expect("midnight is always valid");
-        return (Some(Utc.from_utc_datetime(&naive)), TimestampInterpretation::AssumedUtc);
+        return (
+            Some(Utc.from_utc_datetime(&naive)),
+            TimestampInterpretation::AssumedUtc,
+        );
     }
 
     (None, TimestampInterpretation::Unparsable)
@@ -69,8 +80,14 @@ mod tests {
 
     #[test]
     fn missing_and_blank_values_are_missing() {
-        assert_eq!(parse_source_timestamp(None).1, TimestampInterpretation::Missing);
-        assert_eq!(parse_source_timestamp(Some("   ")).1, TimestampInterpretation::Missing);
+        assert_eq!(
+            parse_source_timestamp(None).1,
+            TimestampInterpretation::Missing
+        );
+        assert_eq!(
+            parse_source_timestamp(Some("   ")).1,
+            TimestampInterpretation::Missing
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
 - Future direction: make the app installable on other Macs
 - MVP outcome: a standalone `.app` opens from Finder and displays fake token-usage data
 - Planned log sources: Cursor, Claude Code, and Codex
-- Refresh behavior: manual import/refresh only
+- Refresh behavior: automatic incremental synchronization (see the entry at the end of this file); manual sync is recovery only
 - MVP data fields:
   - Timestamp
   - Source application
@@ -399,7 +399,7 @@ Not recommended: treating `contextUsagePercent` as plan quota; char/4 estimates;
 3. **Estimating from imported transcripts** — tokens in the last five hours against a guessed ceiling. No credentials needed, but the plan's ceiling is not public, so the number would be invented. Rejected: a fabricated percentage is worse than none.
 4. **`~/.claude.json` → `cachedUsageUtilization`** ← chosen. Claude Code calls the endpoint itself and caches the reply locally, refreshing it as you work. Reading that file gives the same server-side figures `/usage` prints, with zero credential handling, zero network traffic, and zero allowance spent — a local-file read, which is the premise of this app.
 
-The cache holds `five_hour` and `seven_day` windows (plus `seven_day_opus`/`seven_day_sonnet`, non-null only on plans with per-model caps), each with `utilization` and `resets_at`, and `fetchedAtMs` as the snapshot age. `SourceAdapter::quota` became **`quotas`, returning a `Vec`**, since one source can meter several windows at once. `utilization` arrives as a JSON float (`51`, `38.5`, `85.575`); `percent_to_tenths` is the single boundary where a float enters, converting half-up into the integer tenths everything else carries, clamped to `0..=1000`. A window whose `resets_at` has passed is dropped, because its percentage describes a window that no longer exists — and `quotas_at(now)` takes the clock as an argument so this is testable without pinning fixtures to today's date. The **429 heuristic survives as a fallback only**: when the cache is absent or entirely stale, `You've hit your session limit · resets 7:20pm (America/Panama)` still proves a window is exhausted (parsed via `chrono-tz`, minute-less "7pm" included). First real read: 49% left this session, 62% left this week, matching `/usage` exactly.
+The cache holds `five_hour` and `seven_day` windows (plus `seven_day_opus`/`seven_day_sonnet`, non-null only on plans with per-model caps), each with `utilization` and `resets_at`, and `fetchedAtMs` as the snapshot age. `SourceAdapter::quota` became **`quotas`, returning a `Vec`**, since one source can meter several windows at once. `utilization` arrives as a JSON float (`51`, `38.5`, `85.575`); `percent_to_tenths` is the single boundary where a float enters, converting half-up into the integer tenths everything else carries, clamped to `0..=1000`. A window whose `resets_at` has passed is dropped, because its percentage describes a window that no longer exists — and `quotas_at(now)` takes the clock as an argument so this is testable without pinning fixtures to today's date. A `resets_at` of **`null`** means the opposite and is kept: the 5-hour window is rolling, so between sessions Claude reports `{"utilization": 0, "resets_at": null}` because no window is running. `UsageQuota::resets_at` is therefore an `Option`, `is_current_at(now)` is the one place that judgement lives, and the compact window and tray say `not started` where they would otherwise print a time. Dropping it instead — the first behaviour — made the session vanish from the compact window whenever it was untouched, which reads as a missing feature rather than as good news; inventing `now + 5h` would have been a lie about a window that has not begun. Alerts skip these: a window nobody has started has nothing used and no reset to count down to. The **429 heuristic survives as a fallback only**: when the cache is absent or entirely stale, `You've hit your session limit · resets 7:20pm (America/Panama)` still proves a window is exhausted (parsed via `chrono-tz`, minute-less "7pm" included). First real read: 49% left this session, 62% left this week, matching `/usage` exactly.
 
 Presentation follows the same rule in both places: since a source can meter several windows, only the one that **binds first** (least remaining) is shown per source, and every window stays one hover or one click away. The dashboard header shows `claude code · 49% left this session` with all windows, resets, and the snapshot age in the tooltip; the menu bar title shows `302K · claude 49% · codex 63%` and the tray menu lists each window in full (`claude · 49% of the session left · resets Jul 29, 6:50PM`). Deliberately left out for now: `extra_usage`/`spend` in the same cache (credits at 86% of a $40 monthly cap) — that is money against a purchased balance rather than a plan allowance, so it belongs with cost reporting, not here.
 
@@ -480,3 +480,63 @@ Mac App Store distribution is a separate decision because sandboxing can signifi
 6. Cursor, Claude Code, and Codex formats are documented.
 7. Manual log import and SQLite persistence are added.
 8. Signing and distribution for other Macs are prepared.
+
+
+---
+
+## Automatic refresh architecture (July 30, 2026)
+
+Implemented per `REFRESH_ARCHITECTURE_PLAN.md`. Manual refresh is no longer the
+data path.
+
+**One owner.** `src-tauri/src/refresh.rs` owns every trigger, watcher, debounce,
+retry, reconciliation schedule, transaction boundary, and publication. The
+trigger set is exhaustive — startup, local source changed, Claude quota cache
+changed, Cursor local activity, Cursor connection changed, scheduled quota,
+reconciliation, window focus, wake, network recovery, manual — and each maps to
+work on a per-source lane that runs at most one job at a time. Deleted in the
+same cutover: `refresh_all`, `refresh_quotas`, the sleep-first quota loop,
+startup's direct background import, `usage-imported`, `quotas-updated`, the
+frontend `refreshLogs` path, and `usage_sources`' live adapter discovery.
+
+**Enforced in the types.** The repository is split into `UsageReader` and
+`UsageWriter`. Commands, the menu bar, the alerts, and `AppState` hold only the
+reader; the coordinator is handed the sole production writer. `set_quotas`,
+`clear`, and `insert_batch` are gone from the general application surface.
+
+**Persistent storage.** App-owned SQLite in WAL mode holds records, quota
+snapshots, per-source checkpoints, sync health, and a monotonic revision, under
+versioned migrations. A relaunch paints the last committed revision before any
+source is read. A failed transaction changes neither data nor revision. Cursor's
+private last-good quota cache was removed — one last-known-good store, not two
+that can disagree.
+
+**Identity vs. content.** Every record now carries both a `dedupe_key`
+(which event this is, stable across corrections) and a `content_hash` (what
+this observation said). Upsert on identity, replace on differing content,
+no-op on identical content; inserted/updated/unchanged/deleted are reported
+separately. Cursor dashboard identity no longer hashes the whole event —
+which made a corrected charge look like a second charge — but prefers a server
+id and otherwise uses only the fields a correction may not move, backed by
+transactional replacement of the fetched window.
+
+**Incremental reads.** Codex and Claude Code are tailed by byte offset, with
+the incomplete trailing line carried in the checkpoint and — for Codex — the
+rollout id, model, working directory, and next ordinal too, since the
+`session_meta` line that established them may be megabytes behind. Archive
+moves resume by inode rather than restarting by path. Cursor's dashboard uses a
+watermark plus a deliberate backward overlap; its local database is gated on
+size and modification time so a write burst costs one metadata check.
+
+**Two clocks.** `source_observed_at` (when the source says its data was true)
+and `app_synced_at` (when this app last read it) are stored and shown
+separately, because Cursor publishes billing well after the activity that
+caused it. Failures preserve last-known-good values and mark the source stale
+or offline with a non-secret reason.
+
+**One contract to React.** `data-changed` carries a revision that is already
+durable; `dashboard_snapshot` returns everything one screen renders at one
+revision. React subscribes before fetching and ignores events at or below the
+revision it holds, which closes the initial-load race. `dataChanged`
+distinguishes "numbers moved" from "freshness moved", so the menu bar does not
+re-aggregate on an unchanged quota poll.

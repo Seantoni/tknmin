@@ -132,7 +132,10 @@ impl RecentQuery {
 
 impl Default for RecentQuery {
     fn default() -> Self {
-        Self { limit: Self::DEFAULT_LIMIT, filter: SummaryQuery::default() }
+        Self {
+            limit: Self::DEFAULT_LIMIT,
+            filter: SummaryQuery::default(),
+        }
     }
 }
 
@@ -154,7 +157,21 @@ mod tests {
 
     #[test]
     fn recent_query_clamps_limit() {
-        assert_eq!(RecentQuery { limit: 0, ..Default::default() }.effective_limit(), 1);
-        assert_eq!(RecentQuery { limit: 10_000, ..Default::default() }.effective_limit(), RecentQuery::MAX_LIMIT);
+        assert_eq!(
+            RecentQuery {
+                limit: 0,
+                ..Default::default()
+            }
+            .effective_limit(),
+            1
+        );
+        assert_eq!(
+            RecentQuery {
+                limit: 10_000,
+                ..Default::default()
+            }
+            .effective_limit(),
+            RecentQuery::MAX_LIMIT
+        );
     }
 }

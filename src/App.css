@@ -861,12 +861,222 @@ button.strip-row:hover {
   color: var(--danger);
 }
 
+/* Per-source freshness.
+ *
+ * Deliberately quiet: nothing here is an action, and in the normal case —
+ * every source watched and current — it should read as reassurance rather than
+ * as a status panel demanding attention. Only a failed source raises its
+ * contrast, because that is the only case where the numbers above it are older
+ * than they look. */
+.health {
+  list-style: none;
+  margin: 20px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.health-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--faint);
+}
+
+.health-name {
+  min-width: 84px;
+  color: var(--text);
+}
+
+.health-state {
+  min-width: 96px;
+}
+
+.health-age {
+  min-width: 132px;
+}
+
+.health-row.is-offline .health-state,
+.health-row.is-error .health-state {
+  color: var(--danger);
+}
+
+.health-row.is-waiting .health-state {
+  color: var(--text);
+}
+
+.health-error {
+  color: var(--danger);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .foot {
   margin-top: 20px;
   padding-top: 12px;
   border-top: 1px solid var(--line);
   font-size: 10px;
   color: var(--faint);
+}
+
+/* Compact window
+ *
+ * Same vocabulary as the dashboard — hairlines, one hue per source, tabular
+ * figures — at the smallest size the three numbers still read at. Nothing here
+ * scrolls: if it does not fit, it does not belong in this window.
+ */
+
+/* The window is transparent so its corners can be rounded here; the page
+ * behind the panel must not paint over them. */
+.is-mini,
+.is-mini body {
+  background: transparent;
+}
+
+.mini {
+  padding: 8px 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--bg);
+  overflow: hidden;
+  cursor: default;
+  /* Dragging the panel by its title row must not select the title. */
+  user-select: none;
+}
+
+.mini-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mini-brand {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+}
+
+.mini-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mini-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.mini-source {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+/* Said only when it is true: the source has been used since the last number
+ * its provider published, so the percentage above is real but incomplete. */
+.mini-note {
+  margin: 0;
+  font-size: 9px;
+  color: var(--faint);
+}
+
+/* The rail is what says "these belong to the source above" — a hairline rather
+ * than a box, and uncolored, because color in this interface means data. */
+.mini-pools {
+  margin: 0 0 0 2px;
+  padding: 1px 0 1px 9px;
+  border-left: 1px solid var(--line);
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mini-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  cursor: help;
+}
+
+.mini-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mini-name {
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mini-window {
+  font-size: 10px;
+  color: var(--faint);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.mini-left {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.mini-detail {
+  font-size: 10px;
+  color: var(--dim);
+}
+
+.mini-used {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mini-reset {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.mini-bar {
+  display: block;
+  height: 2px;
+  background: var(--line);
+  border-radius: 1px;
+  overflow: hidden;
+}
+
+.mini-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 1px;
+}
+
+.mini-empty {
+  margin: auto 0;
+  text-align: center;
+  font-size: 11px;
+  color: var(--dim);
 }
 
 @media (max-width: 620px) {

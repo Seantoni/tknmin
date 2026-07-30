@@ -19,8 +19,10 @@ pub enum ThresholdMetric {
 }
 
 impl ThresholdMetric {
-    pub const ALL: [ThresholdMetric; 2] =
-        [ThresholdMetric::RemainingPercent, ThresholdMetric::MinutesUntilReset];
+    pub const ALL: [ThresholdMetric; 2] = [
+        ThresholdMetric::RemainingPercent,
+        ThresholdMetric::MinutesUntilReset,
+    ];
 }
 
 /// One source's alert threshold.
@@ -40,6 +42,16 @@ pub struct SourceThreshold {
 #[serde(rename_all = "camelCase")]
 pub struct AppOptions {
     pub thresholds: Vec<SourceThreshold>,
+    /// Whether the compact window floats above other applications. Defaulted
+    /// on deserialize so an options file written before this existed loads.
+    #[serde(default = "always_on_top_default")]
+    pub mini_always_on_top: bool,
+}
+
+/// The compact window exists to stay visible next to an editor, so floating is
+/// the default; the setting is there to turn it off.
+fn always_on_top_default() -> bool {
+    true
 }
 
 impl AppOptions {
@@ -55,6 +67,7 @@ impl AppOptions {
                     value: 25,
                 })
                 .collect(),
+            mini_always_on_top: always_on_top_default(),
         }
     }
 
@@ -95,8 +108,9 @@ impl AppOptions {
 
         let mut seen = [false; SourceApp::ALL.len()];
         for threshold in &self.thresholds {
-            let Some(index) =
-                SourceApp::ALL.iter().position(|&source| source == threshold.source_app)
+            let Some(index) = SourceApp::ALL
+                .iter()
+                .position(|&source| source == threshold.source_app)
             else {
                 return Err(OptionsError::Invalid(format!(
                     "unknown source in thresholds: {}",
@@ -157,7 +171,10 @@ mod tests {
         let options = AppOptions::defaults();
         assert_eq!(options.thresholds.len(), SourceApp::ALL.len());
         for source in SourceApp::ALL {
-            assert!(options.thresholds.iter().any(|row| row.source_app == source));
+            assert!(options
+                .thresholds
+                .iter()
+                .any(|row| row.source_app == source));
         }
     }
 
@@ -170,6 +187,7 @@ mod tests {
                 metric: ThresholdMetric::MinutesUntilReset,
                 value: 60,
             }],
+            ..AppOptions::defaults()
         };
         let normalized = partial.normalized();
         assert_eq!(normalized.thresholds.len(), 3);
@@ -195,7 +213,15 @@ mod tests {
         assert!(json.contains("\"thresholds\""));
         assert!(json.contains("\"sourceApp\""));
         assert!(json.contains("\"remaining_percent\""));
+        assert!(json.contains("\"miniAlwaysOnTop\""));
         let back: AppOptions = serde_json::from_str(&json).unwrap();
         assert_eq!(back, AppOptions::defaults());
+    }
+
+    #[test]
+    fn options_written_before_the_compact_window_still_load() {
+        let json = r#"{"thresholds":[]}"#;
+        let loaded: AppOptions = serde_json::from_str(json).unwrap();
+        assert!(loaded.mini_always_on_top);
     }
 }

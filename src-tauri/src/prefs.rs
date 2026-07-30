@@ -29,17 +29,17 @@ pub fn load_options(path: &Path) -> Result<AppOptions, AppError> {
         )
     })?;
     let options = parsed.normalized();
-    options.validate().map_err(|error| {
-        AppError::new(crate::error::ErrorCode::Storage, error.to_string())
-    })?;
+    options
+        .validate()
+        .map_err(|error| AppError::new(crate::error::ErrorCode::Storage, error.to_string()))?;
     Ok(options)
 }
 
 /// Validate and write options atomically (temp file + rename).
 pub fn save_options(path: &Path, options: &AppOptions) -> Result<(), AppError> {
-    options.validate().map_err(|error| {
-        AppError::invalid_request(error.to_string())
-    })?;
+    options
+        .validate()
+        .map_err(|error| AppError::invalid_request(error.to_string()))?;
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
@@ -84,7 +84,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_file() -> PathBuf {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         std::env::temp_dir().join(format!("tokens-options-{nanos}.json"))
     }
 

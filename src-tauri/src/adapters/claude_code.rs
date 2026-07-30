@@ -25,13 +25,35 @@ use std::fs;
 use std::path::PathBuf;
 
 use chrono::{DateTime, NaiveTime, TimeZone, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::domain::{SourceApp, TokenCounts, TokenField, UsageQuota, UsageRecordDraft};
+use crate::domain::{
+    SourceApp, SourceCheckpoint, TokenCounts, TokenField, UsageQuota, UsageRecordDraft,
+};
 
-use super::{AdapterError, DiscoveredSource, RawSourceInput, SourceAdapter};
+use super::{
+    file_identity, read_from_offset, split_complete_lines, AdapterError, DeltaRequest,
+    DiscoveredSource, RawSourceInput, SourceAdapter, SourceDelta, SyncMode,
+};
 
 const PROJECTS_DIR: &str = "projects";
+
+/// Where reading one transcript resumes.
+///
+/// Simpler than Codex's, because Claude Code writes a globally unique
+/// `message.id` on every assistant line: identity needs no ordinal, and a
+/// later streaming snapshot of the same id is meant to replace the earlier
+/// one rather than sit beside it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptCheckpoint {
+    pub offset: u64,
+    /// The trailing bytes of an incomplete line, held for the next attempt.
+    #[serde(default)]
+    pub partial: String,
+    #[serde(default)]
+    pub size: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct ClaudeCodeAdapter {
@@ -51,7 +73,10 @@ impl ClaudeCodeAdapter {
     const PROVIDER: &'static str = "anthropic";
 
     pub fn new() -> Self {
-        Self { root: default_claude_dir(), config_file: default_config_file() }
+        Self {
+            root: default_claude_dir(),
+            config_file: default_config_file(),
+        }
     }
 
     pub fn with_root(root: PathBuf) -> Self {
@@ -71,7 +96,9 @@ impl ClaudeCodeAdapter {
         let mut files = Vec::new();
         let mut pending = vec![self.root.join(PROJECTS_DIR)];
         while let Some(dir) = pending.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
@@ -105,7 +132,107 @@ impl SourceAdapter for ClaudeCodeAdapter {
         SourceApp::ClaudeCode
     }
 
-    fn discover(&self) -> Result<Vec<DiscoveredSource>, AdapterError> {
+    /// The transcript tree, and the *parent* of `~/.claude.json`.
+    ///
+    /// Watching the config file itself would stop working the first time
+    /// Claude Code replaced it: an atomic write creates a new file and renames
+    /// it over the old one, and a watch on the old inode sees nothing. The
+    /// directory sees the rename.
+    fn watch_roots(&self) -> Vec<PathBuf> {
+        let mut roots = vec![self.root.join(PROJECTS_DIR)];
+        if let Some(parent) = self.config_file.parent() {
+            roots.push(parent.to_path_buf());
+        }
+        roots
+    }
+
+    fn read_delta(&self, request: &DeltaRequest) -> Result<SourceDelta, AdapterError> {
+        let quotas = self.quotas_at(request.now);
+        let source_observed_at = quotas.iter().map(|quota| quota.observed_at).max();
+
+        if request.mode == SyncMode::QuotaOnly {
+            return Ok(SourceDelta {
+                replace_quotas: !quotas.is_empty(),
+                quotas,
+                source_observed_at,
+                ..SourceDelta::default()
+            });
+        }
+
+        // Recursive, and re-walked every pass: a Task tool subagent creates a
+        // nested directory mid-session, and its usage appears nowhere else.
+        let files = self.transcript_files();
+        if files.is_empty() {
+            return Err(AdapterError::Discovery {
+                adapter: Self::ID,
+                reason: "no transcripts found".to_string(),
+            });
+        }
+
+        let mut delta = SourceDelta {
+            replace_quotas: !quotas.is_empty(),
+            quotas,
+            source_observed_at,
+            ..SourceDelta::default()
+        };
+        let base = self.root.join(PROJECTS_DIR);
+
+        for path in files {
+            let Some(source_key) = file_identity(&path) else {
+                continue;
+            };
+            let stored: TranscriptCheckpoint = request.resume(&source_key).unwrap_or_default();
+
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            let size = metadata.len();
+            if size == stored.size && stored.offset == size && stored.partial.is_empty() {
+                continue;
+            }
+
+            let (appended, read_to, restarted) = match read_from_offset(&path, stored.offset) {
+                Ok(result) => result,
+                Err(error) => {
+                    delta
+                        .failures
+                        .push(format!("a Claude Code transcript could not be read: {error}"));
+                    continue;
+                }
+            };
+
+            let carried = if restarted { String::new() } else { stored.partial };
+            let text = format!("{carried}{appended}");
+            let (complete, partial) = split_complete_lines(&text);
+
+            let source_ref = path
+                .strip_prefix(&base)
+                .ok()
+                .and_then(|relative| relative.to_str())
+                .map(|relative| relative.trim_end_matches(".jsonl").to_string())
+                .unwrap_or_else(|| source_key.clone());
+
+            delta.drafts.extend(parse_transcript(self, &source_ref, complete));
+            delta.checkpoints.push(SourceCheckpoint {
+                adapter_id: Self::ID.to_string(),
+                source_key,
+                payload: serde_json::to_value(TranscriptCheckpoint {
+                    offset: read_to,
+                    partial: partial.to_string(),
+                    size,
+                })
+                .unwrap_or_default(),
+            });
+        }
+
+        Ok(delta)
+    }
+}
+
+impl ClaudeCodeAdapter {
+    /// Locate this adapter's transcripts. Kept for tests and diagnostics; the
+    /// running application reaches sources through [`SourceAdapter::read_delta`].
+    pub fn discover(&self) -> Result<Vec<DiscoveredSource>, AdapterError> {
         let base = self.root.join(PROJECTS_DIR);
         let files = self.transcript_files();
         if files.is_empty() {
@@ -132,8 +259,11 @@ impl SourceAdapter for ClaudeCodeAdapter {
             .collect())
     }
 
-    fn read(&self, source: &DiscoveredSource) -> Result<RawSourceInput, AdapterError> {
-        let path = self.root.join(PROJECTS_DIR).join(format!("{}.jsonl", source.source_ref));
+    pub fn read(&self, source: &DiscoveredSource) -> Result<RawSourceInput, AdapterError> {
+        let path = self
+            .root
+            .join(PROJECTS_DIR)
+            .join(format!("{}.jsonl", source.source_ref));
         let content = fs::read_to_string(&path).map_err(|error| AdapterError::Unreadable {
             adapter: Self::ID,
             reason: format!("{}: {error}", path.display()),
@@ -142,56 +272,9 @@ impl SourceAdapter for ClaudeCodeAdapter {
         Ok(RawSourceInput::from_source(source, content))
     }
 
-    fn parse(&self, input: &RawSourceInput) -> Result<Vec<UsageRecordDraft>, AdapterError> {
-        let mut drafts: Vec<UsageRecordDraft> = Vec::new();
-        // message.id → position in drafts; a repeated id overwrites its
-        // snapshot in place, so only the final one survives.
-        let mut positions: HashMap<String, usize> = HashMap::new();
-
-        for line in input.content.lines() {
-            if !line.contains(r#""type":"assistant""#) {
-                continue;
-            }
-            let line: TranscriptLine = match serde_json::from_str(line) {
-                Ok(line) => line,
-                // A truncated final line is normal in a live transcript.
-                Err(_) => continue,
-            };
-            let Some(message) = line.message else { continue };
-            let Some(usage) = message.usage else { continue };
-
-            let provenance = self.provenance(input.source_ref.as_deref());
-            let mut draft = UsageRecordDraft::new(SourceApp::ClaudeCode, provenance)
-                .with_raw_timestamp(line.timestamp.unwrap_or_default())
-                .with_source_event_id(
-                    message.id.clone().or(line.uuid).unwrap_or_default(),
-                )
-                .with_tokens(TokenCounts {
-                    input: sum_as_exact(usage.input_tokens, usage.cache_creation_input_tokens),
-                    output: usage
-                        .output_tokens
-                        .map_or_else(TokenField::unknown, TokenField::exact),
-                    cached_input: usage
-                        .cache_read_input_tokens
-                        .map_or_else(TokenField::unknown, TokenField::exact),
-                    reasoning: TokenField::unknown(),
-                });
-            draft.provider = Some(Self::PROVIDER.to_string());
-            draft.model = message.model;
-            draft.project = line.cwd.as_deref().and_then(project_name);
-            draft.session_id = line.session_id;
-
-            match positions.get(draft.source_event_id.as_deref().unwrap_or_default()) {
-                Some(&pos) => drafts[pos] = draft,
-                None => {
-                    let key = draft.source_event_id.clone().unwrap_or_default();
-                    positions.insert(key, drafts.len());
-                    drafts.push(draft);
-                }
-            }
-        }
-
-        Ok(drafts)
+    pub fn parse(&self, input: &RawSourceInput) -> Result<Vec<UsageRecordDraft>, AdapterError> {
+        let source_ref = input.source_ref.clone().unwrap_or_default();
+        Ok(parse_transcript(self, &source_ref, &input.content))
     }
 
     /// Allowance percentages, read from Claude Code's own cache of them.
@@ -211,10 +294,16 @@ impl SourceAdapter for ClaudeCodeAdapter {
     /// age. A window whose `resets_at` has passed is dropped: its percentage
     /// describes a window that no longer exists.
     ///
+    /// A `resets_at` of `null` means something different and is kept: the
+    /// session window is rolling, so between sessions Claude reports zero used
+    /// and no reset, because no window is running. That is current information —
+    /// the whole session is available — and dropping it would leave the session
+    /// unaccounted for whenever it matters least to hide it.
+    ///
     /// When the cache is missing or entirely stale — a fresh install, or a
     /// version that does not write it — a live 429 transcript line still
     /// proves an allowance is exhausted, and that is used instead.
-    fn quotas(&self) -> Result<Vec<UsageQuota>, AdapterError> {
+    pub fn quotas(&self) -> Result<Vec<UsageQuota>, AdapterError> {
         Ok(self.quotas_at(Utc::now()))
     }
 }
@@ -227,7 +316,7 @@ impl ClaudeCodeAdapter {
             .cached_utilization()
             .unwrap_or_default()
             .into_iter()
-            .filter(|quota| quota.resets_at > now)
+            .filter(|quota| quota.is_current_at(now))
             .collect();
         if !live.is_empty() {
             return live;
@@ -246,24 +335,33 @@ impl ClaudeCodeAdapter {
         let utilization = cache.utilization?;
         Some(
             [
-                (SESSION_WINDOW_MINUTES, utilization.five_hour),
-                (WEEK_WINDOW_MINUTES, utilization.seven_day),
+                (None, SESSION_WINDOW_MINUTES, utilization.five_hour),
+                (None, WEEK_WINDOW_MINUTES, utilization.seven_day),
                 // Per-model weekly caps exist on some plans and are null on
                 // others; when present they bind just as hard as the rest.
-                (WEEK_WINDOW_MINUTES, utilization.seven_day_opus),
-                (WEEK_WINDOW_MINUTES, utilization.seven_day_sonnet),
+                // They share the week's length, so only the label tells them
+                // apart from the overall cap — and from each other.
+                (Some("Opus"), WEEK_WINDOW_MINUTES, utilization.seven_day_opus),
+                (
+                    Some("Sonnet"),
+                    WEEK_WINDOW_MINUTES,
+                    utilization.seven_day_sonnet,
+                ),
             ]
             .into_iter()
-            .filter_map(|(window_minutes, window)| {
+            .filter_map(|(label, window_minutes, window)| {
                 let window = window?;
                 Some(UsageQuota {
                     source_app: SourceApp::ClaudeCode,
-                    label: None,
+                    label: label.map(str::to_string),
                     window_minutes,
                     used_percent_tenths: percent_to_tenths(window.utilization?),
-                    resets_at: DateTime::parse_from_rfc3339(window.resets_at.as_deref()?)
-                        .ok()?
-                        .to_utc(),
+                    // Absent means no window is running; present but unreadable
+                    // means the snapshot cannot be trusted, so the window goes.
+                    resets_at: match window.resets_at.as_deref() {
+                        Some(raw) => Some(DateTime::parse_from_rfc3339(raw).ok()?.to_utc()),
+                        None => None,
+                    },
                     observed_at,
                 })
             })
@@ -281,12 +379,16 @@ impl ClaudeCodeAdapter {
         files.sort_by_key(|path| fs::metadata(path).and_then(|meta| meta.modified()).ok());
 
         for path in files.iter().rev().take(FRESHEST_FILES_FOR_QUOTA) {
-            let Ok(content) = fs::read_to_string(path) else { continue };
+            let Ok(content) = fs::read_to_string(path) else {
+                continue;
+            };
             for line in content.lines().rev() {
                 if !line.contains(r#""error":"rate_limit""#) {
                     continue;
                 }
-                let Ok(parsed) = serde_json::from_str::<LimitLine>(line) else { continue };
+                let Ok(parsed) = serde_json::from_str::<LimitLine>(line) else {
+                    continue;
+                };
                 if let Some(quota) = quota_from_limit_line(&parsed, now) {
                     return Some(quota);
                 }
@@ -294,6 +396,68 @@ impl ClaudeCodeAdapter {
         }
         None
     }
+}
+
+/// Turn assistant lines into drafts, keeping one per `message.id`.
+///
+/// Streaming writes the same id on several lines, each a snapshot of the
+/// in-flight message, so the last one within a chunk wins here. Across chunks
+/// the repository does the same job: identity is the id, so a later snapshot
+/// updates the stored row rather than adding to it, and the counts converge on
+/// the final ones without any of the interim values surviving.
+fn parse_transcript(
+    adapter: &ClaudeCodeAdapter,
+    source_ref: &str,
+    content: &str,
+) -> Vec<UsageRecordDraft> {
+    let mut drafts: Vec<UsageRecordDraft> = Vec::new();
+    let mut positions: HashMap<String, usize> = HashMap::new();
+
+    for line in content.lines() {
+        if !line.contains(r#""type":"assistant""#) {
+            continue;
+        }
+        let line: TranscriptLine = match serde_json::from_str(line) {
+            Ok(line) => line,
+            // A line this build cannot make sense of is skipped rather than
+            // failing the transcript around it.
+            Err(_) => continue,
+        };
+        let Some(message) = line.message else {
+            continue;
+        };
+        let Some(usage) = message.usage else { continue };
+
+        let provenance = adapter.provenance(Some(source_ref));
+        let mut draft = UsageRecordDraft::new(SourceApp::ClaudeCode, provenance)
+            .with_raw_timestamp(line.timestamp.unwrap_or_default())
+            .with_source_event_id(message.id.clone().or(line.uuid).unwrap_or_default())
+            .with_tokens(TokenCounts {
+                input: sum_as_exact(usage.input_tokens, usage.cache_creation_input_tokens),
+                output: usage
+                    .output_tokens
+                    .map_or_else(TokenField::unknown, TokenField::exact),
+                cached_input: usage
+                    .cache_read_input_tokens
+                    .map_or_else(TokenField::unknown, TokenField::exact),
+                reasoning: TokenField::unknown(),
+            });
+        draft.provider = Some(ClaudeCodeAdapter::PROVIDER.to_string());
+        draft.model = message.model;
+        draft.project = line.cwd.as_deref().and_then(project_name);
+        draft.session_id = line.session_id;
+
+        match positions.get(draft.source_event_id.as_deref().unwrap_or_default()) {
+            Some(&position) => drafts[position] = draft,
+            None => {
+                let key = draft.source_event_id.clone().unwrap_or_default();
+                positions.insert(key, drafts.len());
+                drafts.push(draft);
+            }
+        }
+    }
+
+    drafts
 }
 
 const SESSION_WINDOW_MINUTES: u32 = 300;
@@ -317,8 +481,16 @@ fn quota_from_limit_line(line: &LimitLine, now: DateTime<Utc>) -> Option<UsageQu
     if line.error.as_deref() != Some("rate_limit") {
         return None;
     }
-    let observed_at = DateTime::parse_from_rfc3339(line.timestamp.as_deref()?).ok()?.to_utc();
-    let text = line.message.as_ref()?.content.as_ref()?.iter().find_map(|c| c.text.as_deref())?;
+    let observed_at = DateTime::parse_from_rfc3339(line.timestamp.as_deref()?)
+        .ok()?
+        .to_utc();
+    let text = line
+        .message
+        .as_ref()?
+        .content
+        .as_ref()?
+        .iter()
+        .find_map(|c| c.text.as_deref())?;
 
     let (head, tail) = text.split_once(" · resets ")?;
     let window_minutes = if head.contains("session limit") {
@@ -357,7 +529,7 @@ fn quota_from_limit_line(line: &LimitLine, now: DateTime<Utc>) -> Option<UsageQu
         label: None,
         window_minutes,
         used_percent_tenths: 1_000,
-        resets_at,
+        resets_at: Some(resets_at),
         observed_at,
     })
 }
@@ -377,7 +549,11 @@ fn parse_reset_time(text: &str) -> Option<NaiveTime> {
     if !(1..=12).contains(&hour) || minute > 59 {
         return None;
     }
-    let hour = if meridiem == "am" { hour % 12 } else { hour % 12 + 12 };
+    let hour = if meridiem == "am" {
+        hour % 12
+    } else {
+        hour % 12 + 12
+    };
     NaiveTime::from_hms_opt(hour, minute, 0)
 }
 
@@ -385,16 +561,21 @@ fn parse_reset_time(text: &str) -> Option<NaiveTime> {
 fn sum_as_exact(input: Option<u64>, cache_creation: Option<u64>) -> TokenField {
     match (input, cache_creation) {
         (None, None) => TokenField::unknown(),
-        (input, cache_creation) => {
-            TokenField::exact(input.unwrap_or(0).saturating_add(cache_creation.unwrap_or(0)))
-        }
+        (input, cache_creation) => TokenField::exact(
+            input
+                .unwrap_or(0)
+                .saturating_add(cache_creation.unwrap_or(0)),
+        ),
     }
 }
 
 /// The project is the working directory's final component — the only part of
 /// the path a record is allowed to carry.
 fn project_name(cwd: &str) -> Option<String> {
-    cwd.rsplit('/').next().filter(|name| !name.is_empty()).map(str::to_string)
+    cwd.rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 #[derive(Deserialize)]
@@ -530,7 +711,10 @@ mod tests {
         assert_eq!(first.tokens.output, TokenField::exact(374));
         assert_eq!(first.tokens.reasoning, TokenField::unknown());
         // The last snapshot's timestamp wins.
-        assert_eq!(first.raw_timestamp.as_deref(), Some("2026-07-29T20:00:53.212Z"));
+        assert_eq!(
+            first.raw_timestamp.as_deref(),
+            Some("2026-07-29T20:00:53.212Z")
+        );
         assert_eq!(first.provider.as_deref(), Some("anthropic"));
         assert_eq!(first.model.as_deref(), Some("claude-opus-5"));
         assert_eq!(first.project.as_deref(), Some("project"));
@@ -576,17 +760,26 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tokens-claude-{}", std::process::id()));
         let project = root.join("projects").join("-Users-dev-project");
         fs::create_dir_all(&project).unwrap();
-        fs::write(project.join("3cff86d3-6a42-4a80-9f50-b41e10ffebbc.jsonl"), "").unwrap();
+        fs::write(
+            project.join("3cff86d3-6a42-4a80-9f50-b41e10ffebbc.jsonl"),
+            "",
+        )
+        .unwrap();
         fs::write(project.join("notes.txt"), "").unwrap();
         // Subagent transcripts nest under the session directory.
-        let subagents = project.join("3cff86d3-6a42-4a80-9f50-b41e10ffebbc").join("subagents");
+        let subagents = project
+            .join("3cff86d3-6a42-4a80-9f50-b41e10ffebbc")
+            .join("subagents");
         fs::create_dir_all(&subagents).unwrap();
         fs::write(subagents.join("agent-a1e82699a9b25696f.jsonl"), "").unwrap();
         fs::create_dir_all(root.join("not-projects")).unwrap();
 
         let adapter = ClaudeCodeAdapter::with_root(root.clone());
         let sources = adapter.discover().unwrap();
-        let refs: Vec<_> = sources.iter().map(|source| source.source_ref.as_str()).collect();
+        let refs: Vec<_> = sources
+            .iter()
+            .map(|source| source.source_ref.as_str())
+            .collect();
         // Path ordering is component-wise: the session directory sorts ahead
         // of the `.jsonl` sibling whose name it prefixes.
         assert_eq!(
@@ -608,7 +801,10 @@ mod tests {
     #[test]
     fn reports_discovery_failure_when_no_logs_exist() {
         let adapter = ClaudeCodeAdapter::with_root(PathBuf::from("/definitely/not/here"));
-        assert!(matches!(adapter.discover(), Err(AdapterError::Discovery { .. })));
+        assert!(matches!(
+            adapter.discover(),
+            Err(AdapterError::Discovery { .. })
+        ));
     }
 
     fn limit_line(text: &str) -> LimitLine {
@@ -622,7 +818,9 @@ mod tests {
 
     fn fixed_now() -> DateTime<Utc> {
         // Two hours after the error below, still inside the session window.
-        DateTime::parse_from_rfc3339("2026-07-13T22:46:48Z").unwrap().to_utc()
+        DateTime::parse_from_rfc3339("2026-07-13T22:46:48Z")
+            .unwrap()
+            .to_utc()
     }
 
     #[test]
@@ -633,9 +831,15 @@ mod tests {
         assert_eq!(quota.source_app, SourceApp::ClaudeCode);
         assert_eq!(quota.window_minutes, 300);
         assert_eq!(quota.used_percent_tenths, 1_000);
-        assert_eq!(quota.observed_at.to_rfc3339(), "2026-07-13T20:46:48.803+00:00");
+        assert_eq!(
+            quota.observed_at.to_rfc3339(),
+            "2026-07-13T20:46:48.803+00:00"
+        );
         // 7:20pm in America/Panama (UTC-5) on the error's own date.
-        assert_eq!(quota.resets_at.to_rfc3339(), "2026-07-14T00:20:00+00:00");
+        assert_eq!(
+            quota.resets_at.unwrap().to_rfc3339(),
+            "2026-07-14T00:20:00+00:00"
+        );
     }
 
     #[test]
@@ -644,7 +848,10 @@ mod tests {
         // the following day.
         let line = limit_line("You've hit your session limit · resets 1:10pm (America/Panama)");
         let quota = quota_from_limit_line(&line, fixed_now()).unwrap();
-        assert_eq!(quota.resets_at.to_rfc3339(), "2026-07-14T18:10:00+00:00");
+        assert_eq!(
+            quota.resets_at.unwrap().to_rfc3339(),
+            "2026-07-14T18:10:00+00:00"
+        );
     }
 
     #[test]
@@ -659,7 +866,9 @@ mod tests {
     fn an_expired_window_is_history_not_state() {
         // Now is long past the reset: nothing about the present can be said.
         let line = limit_line("You've hit your session limit · resets 7:20pm (America/Panama)");
-        let now = DateTime::parse_from_rfc3339("2026-07-15T00:00:00Z").unwrap().to_utc();
+        let now = DateTime::parse_from_rfc3339("2026-07-15T00:00:00Z")
+            .unwrap()
+            .to_utc();
         assert_eq!(quota_from_limit_line(&line, now), None);
     }
 
@@ -708,7 +917,9 @@ mod tests {
     /// Between the two resets in `config_json`, so the session window is live
     /// and the weekly one is too.
     fn before_both_resets() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-07-29T22:00:00Z").unwrap().to_utc()
+        DateTime::parse_from_rfc3339("2026-07-29T22:00:00Z")
+            .unwrap()
+            .to_utc()
     }
 
     #[test]
@@ -729,12 +940,74 @@ mod tests {
         assert_eq!(session.window_minutes, 300);
         assert_eq!(session.used_percent_tenths, 510);
         assert_eq!(session.remaining_percent_tenths(), 490);
-        assert_eq!(session.observed_at.to_rfc3339(), "2026-07-29T21:08:09.614+00:00");
+        assert_eq!(
+            session.observed_at.to_rfc3339(),
+            "2026-07-29T21:08:09.614+00:00"
+        );
 
         let week = &quotas[1];
         assert_eq!(week.window_minutes, 10_080);
         // 38.5% survives as tenths rather than rounding to a whole percent.
         assert_eq!(week.used_percent_tenths, 385);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_session_between_windows_is_reported_as_untouched_not_dropped() {
+        let dir = std::env::temp_dir().join(format!("tokens-claude-idle-{}", std::process::id()));
+        // What Claude writes when no session is running: nothing used, and no
+        // reset, because the rolling window has not started.
+        let mut config: serde_json::Value = serde_json::from_str(&config_json(
+            1_785_359_289_614,
+            "2026-07-29T23:50:00.308400+00:00",
+            "2026-07-31T23:00:00.308427+00:00",
+        ))
+        .unwrap();
+        config["cachedUsageUtilization"]["utilization"]["five_hour"] =
+            serde_json::json!({ "utilization": 0, "resets_at": null, "limit_dollars": null });
+        let adapter = adapter_with_config(&dir, &config.to_string());
+
+        let quotas = adapter.quotas_at(before_both_resets());
+        assert_eq!(quotas.len(), 2);
+
+        let session = &quotas[0];
+        assert_eq!(session.window_minutes, 300);
+        assert_eq!(session.resets_at, None);
+        assert_eq!(session.remaining_percent_tenths(), 1_000);
+        // Still current: it says the whole session is available right now.
+        assert!(session.is_current_at(before_both_resets()));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn per_model_weekly_caps_are_labelled_so_they_can_be_told_apart() {
+        let dir = std::env::temp_dir().join(format!("tokens-claude-models-{}", std::process::id()));
+        // Opus and Sonnet share the week's length with the overall cap, so
+        // without a label three rows would claim to measure the same thing.
+        let config = config_json(
+            1_785_359_289_614,
+            "2026-07-29T23:50:00.308400+00:00",
+            "2026-07-31T23:00:00.308427+00:00",
+        )
+        .replace(
+            r#""seven_day_opus":null"#,
+            r#""seven_day_opus":{"utilization":12.5,"resets_at":"2026-07-31T23:00:00.308427+00:00"}"#,
+        )
+        .replace(
+            r#""seven_day_sonnet":null"#,
+            r#""seven_day_sonnet":{"utilization":4,"resets_at":"2026-07-31T23:00:00.308427+00:00"}"#,
+        );
+        let adapter = adapter_with_config(&dir, &config);
+
+        let quotas = adapter.quotas_at(before_both_resets());
+        let labels: Vec<_> = quotas.iter().map(|quota| quota.label.as_deref()).collect();
+        assert_eq!(labels, vec![None, None, Some("Opus"), Some("Sonnet")]);
+
+        let opus = &quotas[2];
+        assert_eq!(opus.window_minutes, 10_080);
+        assert_eq!(opus.used_percent_tenths, 125);
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -751,7 +1024,9 @@ mod tests {
 
         // An hour after the session window rolled over, but inside the week:
         // the 51% describes a window that no longer exists.
-        let after_session = DateTime::parse_from_rfc3339("2026-07-30T01:00:00Z").unwrap().to_utc();
+        let after_session = DateTime::parse_from_rfc3339("2026-07-30T01:00:00Z")
+            .unwrap()
+            .to_utc();
         let quotas = adapter.quotas_at(after_session);
         assert_eq!(quotas.len(), 1);
         assert_eq!(quotas[0].window_minutes, 10_080);
@@ -761,7 +1036,8 @@ mod tests {
 
     #[test]
     fn a_config_without_the_cache_falls_back_to_transcripts() {
-        let dir = std::env::temp_dir().join(format!("tokens-claude-nocache-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("tokens-claude-nocache-{}", std::process::id()));
         let adapter = adapter_with_config(&dir, r#"{"numStartups":1}"#);
         assert!(adapter.quotas().unwrap().is_empty());
 
@@ -830,5 +1106,189 @@ mod tests {
 
         let quiet = ClaudeCodeAdapter::with_root(PathBuf::from("/definitely/not/here"));
         assert!(quiet.quotas().unwrap().is_empty());
+    }
+
+    /// A scratch `.claude` tree, cleaned up by the caller.
+    fn scratch(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("tokens-claude-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(PROJECTS_DIR).join("app")).unwrap();
+        root
+    }
+
+    /// Run one delta, feeding back the checkpoints the previous one produced.
+    fn tail(
+        adapter: &ClaudeCodeAdapter,
+        carried: &mut Vec<SourceCheckpoint>,
+    ) -> SourceDelta {
+        let request = DeltaRequest {
+            mode: SyncMode::Incremental,
+            checkpoints: carried.clone(),
+            now: Utc::now(),
+        };
+        let delta = adapter.read_delta(&request).unwrap();
+        for checkpoint in &delta.checkpoints {
+            carried.retain(|kept| kept.source_key != checkpoint.source_key);
+            carried.push(checkpoint.clone());
+        }
+        delta
+    }
+
+    fn assistant_line(id: &str, output: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","uuid":"u-{id}","timestamp":"2026-07-29T10:00:00.000Z","cwd":"/x/app","sessionId":"s1","message":{{"id":"{id}","model":"claude-opus-5","usage":{{"input_tokens":100,"output_tokens":{output},"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn streaming_snapshots_converge_on_the_final_counts() {
+        let root = scratch("streaming");
+        let path = root.join(PROJECTS_DIR).join("app").join("s1.jsonl");
+        // Three snapshots of one in-flight message, as streaming writes them.
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n",
+                assistant_line("msg_01", 5),
+                assistant_line("msg_01", 60),
+                assistant_line("msg_01", 214),
+            ),
+        )
+        .unwrap();
+
+        let adapter = ClaudeCodeAdapter::with_root(root.clone());
+        let delta = tail(&adapter, &mut Vec::new());
+
+        // One draft, carrying the last snapshot: identity is the message id,
+        // so the interim values never become separate records.
+        assert_eq!(delta.drafts.len(), 1);
+        assert_eq!(delta.drafts[0].source_event_id.as_deref(), Some("msg_01"));
+        assert_eq!(delta.drafts[0].tokens.output, TokenField::exact(214));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_arriving_in_a_later_chunk_keeps_the_same_identity() {
+        let root = scratch("chunked");
+        let path = root.join(PROJECTS_DIR).join("app").join("s1.jsonl");
+        fs::write(&path, format!("{}\n", assistant_line("msg_01", 5))).unwrap();
+
+        let adapter = ClaudeCodeAdapter::with_root(root.clone());
+        let mut carried = Vec::new();
+        let first = tail(&adapter, &mut carried);
+        assert_eq!(first.drafts[0].tokens.output, TokenField::exact(5));
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{}", assistant_line("msg_01", 214)).unwrap();
+        drop(file);
+
+        // The second chunk knows nothing of the first, but the id is the same,
+        // so the repository updates the row rather than adding one.
+        let second = tail(&adapter, &mut carried);
+        assert_eq!(second.drafts.len(), 1);
+        assert_eq!(second.drafts[0].source_event_id.as_deref(), Some("msg_01"));
+        assert_eq!(second.drafts[0].tokens.output, TokenField::exact(214));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_new_nested_subagent_log_is_found_without_a_restart() {
+        let root = scratch("subagent");
+        let path = root.join(PROJECTS_DIR).join("app").join("s1.jsonl");
+        fs::write(&path, format!("{}\n", assistant_line("msg_01", 5))).unwrap();
+
+        let adapter = ClaudeCodeAdapter::with_root(root.clone());
+        let mut carried = Vec::new();
+        assert_eq!(tail(&adapter, &mut carried).drafts.len(), 1);
+
+        // A Task tool subagent creates its directory mid-session; its usage
+        // appears nowhere else, so the walk has to find it on the next pass.
+        let nested = root.join(PROJECTS_DIR).join("app").join("s1").join("subagents");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("agent-1.jsonl"),
+            format!("{}\n", assistant_line("msg_02", 40)),
+        )
+        .unwrap();
+
+        let second = tail(&adapter, &mut carried);
+        assert_eq!(second.drafts.len(), 1);
+        assert_eq!(second.drafts[0].source_event_id.as_deref(), Some("msg_02"));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_partial_final_line_is_held_until_it_completes() {
+        let root = scratch("partial");
+        let path = root.join(PROJECTS_DIR).join("app").join("s1.jsonl");
+        let whole = assistant_line("msg_01", 5);
+        let torn = assistant_line("msg_02", 214);
+        fs::write(&path, format!("{whole}\n{}", &torn[..torn.len() / 2])).unwrap();
+
+        let adapter = ClaudeCodeAdapter::with_root(root.clone());
+        let mut carried = Vec::new();
+        let first = tail(&adapter, &mut carried);
+        assert_eq!(first.drafts.len(), 1);
+        assert!(first.failures.is_empty());
+
+        fs::write(&path, format!("{whole}\n{torn}\n")).unwrap();
+        let second = tail(&adapter, &mut carried);
+        assert_eq!(second.drafts.len(), 1);
+        assert_eq!(second.drafts[0].source_event_id.as_deref(), Some("msg_02"));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn allowance_freshness_is_the_sources_own_stamp() {
+        let root = scratch("freshness");
+        fs::write(
+            root.join(PROJECTS_DIR).join("app").join("s1.jsonl"),
+            format!("{}\n", assistant_line("msg_01", 5)),
+        )
+        .unwrap();
+        let config = root.join("claude.json");
+        // fetchedAtMs is when Claude Code got the numbers, which is not when
+        // this app read the file. Reporting the read time would make an hour-
+        // old allowance look live.
+        let fetched_at = Utc::now() - chrono::Duration::minutes(40);
+        fs::write(
+            &config,
+            config_json(
+                fetched_at.timestamp_millis(),
+                &(Utc::now() + chrono::Duration::hours(2)).to_rfc3339(),
+                &(Utc::now() + chrono::Duration::days(3)).to_rfc3339(),
+            ),
+        )
+        .unwrap();
+
+        let adapter = ClaudeCodeAdapter::with_paths(root.clone(), config);
+        let delta = tail(&adapter, &mut Vec::new());
+
+        assert!(!delta.quotas.is_empty());
+        let observed = delta.source_observed_at.unwrap();
+        assert!((observed - fetched_at).num_seconds().abs() < 2);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_watched_roots_cover_an_atomically_replaced_config() {
+        let adapter = ClaudeCodeAdapter::with_paths(
+            PathBuf::from("/home/.claude"),
+            PathBuf::from("/home/.claude.json"),
+        );
+        let roots = adapter.watch_roots();
+
+        assert!(roots.contains(&PathBuf::from("/home/.claude/projects")));
+        // The parent, not the file: an atomic write replaces the inode, and a
+        // watch on the old one would go quiet forever.
+        assert!(roots.contains(&PathBuf::from("/home")));
+        assert!(!roots.contains(&PathBuf::from("/home/.claude.json")));
     }
 }

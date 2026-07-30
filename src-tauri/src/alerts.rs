@@ -9,18 +9,17 @@ use std::sync::Mutex;
 
 use chrono::Utc;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
-use tauri_plugin_notification::{NotificationExt, PermissionState};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 
-use crate::domain::{evaluate_alerts, AppOptions, ThresholdAlert, UsageQuota};
+use crate::domain::{evaluate_alerts, AppOptions, ThresholdAlert, UsageQuota, HANDOFF_PROMPT};
 use crate::error::{AppError, ErrorCode};
 use crate::state::AppState;
 
-/// Action identifiers on the OS notification. Handlers are not wired yet —
-/// the buttons are shown so we can judge the look.
+/// Action identifiers on the OS notification.
 pub const ACTION_CREATE_HANDOFF: &str = "create_handoff";
 pub const ACTION_CONTINUE: &str = "continue";
 
-const ACTION_CREATE_HANDOFF_LABEL: &str = "Generate handoff MD file";
+const ACTION_CREATE_HANDOFF_LABEL: &str = "Copy handoff prompt";
 const ACTION_CONTINUE_LABEL: &str = "Continue";
 
 /// In-process ledger of alerts already delivered this run, plus snoozes.
@@ -47,7 +46,17 @@ impl AlertLedger {
     }
 
     pub fn snoozed_keys(&self) -> HashSet<String> {
-        self.snoozed.lock().map(|set| set.clone()).unwrap_or_default()
+        self.snoozed
+            .lock()
+            .map(|set| set.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn has_fired(&self, dedupe_key: &str) -> bool {
+        self.fired
+            .lock()
+            .map(|set| set.contains(dedupe_key))
+            .unwrap_or(true)
     }
 
     /// Returns true the first time this key is marked fired.
@@ -72,7 +81,9 @@ impl AlertLedger {
 
 /// Re-read options + quotas and notify for any new crossings.
 pub fn evaluate_and_notify<R: Runtime>(app: &AppHandle<R>) {
-    let Some(state) = app.try_state::<AppState>() else { return };
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
     let options = state.options();
     let quotas = state.quotas();
     evaluate_and_notify_with(app, &options, &quotas, state.alerts());
@@ -96,9 +107,23 @@ pub fn evaluate_and_notify_with<R: Runtime>(
     let active = evaluate_alerts(options, quotas, now, &ledger.snoozed_keys());
 
     for alert in &active {
-        if ledger.mark_fired(alert.dedupe_key.clone()) {
-            ensure_permission(app);
-            let _ = show_alert_notification(app, &alert.title(), &alert.body());
+        if ledger.has_fired(&alert.dedupe_key) {
+            continue;
+        }
+        // Only mark fired after macOS accepts delivery, so a denied permission
+        // or transient failure can retry on the next poll.
+        if ensure_notification_auth().is_err() {
+            continue;
+        }
+        if show_alert_notification(
+            app,
+            &alert.title(),
+            &alert.body(),
+            Some(alert.dedupe_key.clone()),
+        )
+        .is_ok()
+        {
+            ledger.mark_fired(alert.dedupe_key.clone());
         }
     }
 
@@ -106,51 +131,71 @@ pub fn evaluate_and_notify_with<R: Runtime>(
 }
 
 /// Active (non-snoozed) alerts right now — for the window on demand.
-pub fn active_alerts(options: &AppOptions, quotas: &[UsageQuota], ledger: &AlertLedger) -> Vec<ThresholdAlert> {
+pub fn active_alerts(
+    options: &AppOptions,
+    quotas: &[UsageQuota],
+    ledger: &AlertLedger,
+) -> Vec<ThresholdAlert> {
     evaluate_alerts(options, quotas, Utc::now(), &ledger.snoozed_keys())
 }
 
-fn ensure_permission<R: Runtime>(app: &AppHandle<R>) {
-    let notification = app.notification();
-    match notification.permission_state() {
-        Ok(PermissionState::Granted) => {}
-        _ => {
-            let _ = notification.request_permission();
+/// Ask macOS for notification permission (or confirm it is already granted).
+///
+/// Uses `UNUserNotificationCenter` via notify-rust's `preview-macos-un`
+/// backend. The Tauri desktop notification plugin's permission APIs are
+/// hard-coded to "granted" on macOS and must not be trusted.
+pub fn ensure_notification_auth() -> Result<(), AppError> {
+    #[cfg(target_os = "macos")]
+    {
+        notify_rust::check_bundle().map_err(|error| {
+            AppError::new(
+                ErrorCode::Storage,
+                format!("notifications require a signed app bundle: {error}"),
+            )
+        })?;
+
+        let granted = notify_rust::request_auth_blocking().map_err(|error| {
+            AppError::new(
+                ErrorCode::Storage,
+                format!("could not request notification permission: {error}"),
+            )
+        })?;
+
+        if !granted {
+            return Err(AppError::new(
+                ErrorCode::Storage,
+                "notifications are denied — enable Tokens in System Settings → Notifications",
+            ));
         }
     }
+
+    Ok(())
 }
 
 /// Sample notification matching a real threshold alert, for Settings preview.
+///
+/// Returns only after macOS accepts the notification request (or an error).
 pub fn send_test_notification<R: Runtime>(app: &AppHandle<R>) -> Result<(), AppError> {
-    ensure_permission(app);
+    ensure_notification_auth()?;
     show_alert_notification(
         app,
         "Claude running low",
         "12% left this session · threshold 25%",
+        None,
     )
 }
 
-/// macOS notification with the two alert actions visible (no handlers yet).
+/// macOS notification with working Continue / Create handoff actions.
 ///
-/// Uses `notify-rust` directly because Tauri's desktop notification plugin
-/// does not forward action buttons on macOS.
+/// Uses notify-rust's `UNUserNotificationCenter` backend (`preview-macos-un`)
+/// so action buttons work and banners present while Tokens is foregrounded.
 fn show_alert_notification<R: Runtime>(
     app: &AppHandle<R>,
     title: &str,
     body: &str,
+    dedupe_key: Option<String>,
 ) -> Result<(), AppError> {
-    let identifier = app.config().identifier.clone();
-
-    #[cfg(target_os = "macos")]
-    {
-        let _ = notify_rust::set_application(if tauri::is_dev() {
-            "com.apple.Terminal"
-        } else {
-            identifier.as_str()
-        });
-    }
-
-    notify_rust::Notification::new()
+    let handle = notify_rust::Notification::new()
         .summary(title)
         .body(body)
         .action(ACTION_CREATE_HANDOFF, ACTION_CREATE_HANDOFF_LABEL)
@@ -163,5 +208,35 @@ fn show_alert_notification<R: Runtime>(
             )
         })?;
 
+    let app = app.clone();
+    std::thread::spawn(move || {
+        handle.wait_for_action(|action| match action {
+            ACTION_CREATE_HANDOFF => {
+                show_main_window(&app);
+                if app.clipboard().write_text(HANDOFF_PROMPT).is_ok() {
+                    let _ = app.emit("threshold-handoff-copied", dedupe_key);
+                }
+            }
+            ACTION_CONTINUE => {
+                if let Some(dedupe_key) = dedupe_key {
+                    if let Some(state) = app.try_state::<AppState>() {
+                        state.alerts().snooze(dedupe_key);
+                        evaluate_and_notify(&app);
+                    }
+                }
+                show_main_window(&app);
+            }
+            "default" => show_main_window(&app),
+            _ => {}
+        });
+    });
+
     Ok(())
+}
+
+/// Acting on a notification takes the user to the dashboard, since that is
+/// where the banner and its handoff button live — even if the compact window
+/// was the one on screen.
+fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
+    crate::mini::show_dashboard(app);
 }

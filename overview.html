@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tokens — Interactive Overview</title>
+<style>
+  :root {
+    --bg: #0a0b0c; --panel: #111316; --panel2: #16191d; --border: #23262b;
+    --text: #c9ced4; --muted: #848b94; --head: #f0f2f4;
+    --cursor: #7aa2f7; --claude: #dda06a; --codex: #6cc4a1;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14.5px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 40px 24px 80px; }
+  h1 { color: var(--head); font-size: 28px; letter-spacing: -.02em; margin: 0 0 4px; }
+  .tag { color: var(--muted); margin: 0 0 24px; }
+  .tag em { color: var(--text); }
+
+  /* nav */
+  .nav { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 6px;
+    background: var(--bg); padding: 12px 0; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+  .nav button { font: inherit; font-size: 13px; color: var(--muted); background: none;
+    border: 1px solid var(--border); border-radius: 999px; padding: 5px 14px; cursor: pointer; }
+  .nav button:hover { color: var(--text); border-color: var(--muted); }
+  .nav button.on { color: var(--head); background: var(--panel2); border-color: var(--muted); }
+
+  section.page { display: none; }
+  section.page.show { display: block; animation: fade .18s ease; }
+  @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
+  h2 { color: var(--head); font-size: 19px; margin: 0 0 6px; }
+  .lede { color: var(--muted); margin: 0 0 20px; }
+  h3 { color: var(--head); font-size: 14px; margin: 24px 0 10px; }
+  p { margin: 9px 0; }
+  ul { margin: 9px 0; padding-left: 20px; }
+  li { margin: 5px 0; }
+  strong { color: var(--head); font-weight: 600; }
+  code { font-family: var(--mono); font-size: 12px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 13px 15px; overflow-x: auto; }
+  pre code { background: none; border: none; padding: 0; line-height: 1.6; }
+
+  /* expandable cards (features, design) */
+  .acc { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; margin: 8px 0; }
+  .acc-head { width: 100%; display: flex; align-items: center; gap: 10px; text-align: left;
+    font: inherit; color: var(--head); background: none; border: none; padding: 13px 16px; cursor: pointer; }
+  .acc-head .caret { margin-left: auto; color: var(--muted); transition: transform .15s; font-size: 11px; }
+  .acc.open .acc-head .caret { transform: rotate(90deg); }
+  .acc-head .hint { color: var(--muted); font-size: 12.5px; font-weight: 400; }
+  .acc-body { display: none; padding: 0 16px 14px; border-top: 1px solid var(--border); }
+  .acc.open .acc-body { display: block; padding-top: 12px; }
+
+  /* tabs (sources) */
+  .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .tabs button { font: inherit; font-size: 13.5px; color: var(--muted); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; cursor: pointer; }
+  .tabs button:hover { color: var(--text); }
+  .tabs button.on { color: var(--head); background: var(--panel2); }
+  .tabs button.on[data-src="cursor"] { border-color: var(--cursor); }
+  .tabs button.on[data-src="claude"] { border-color: var(--claude); }
+  .tabs button.on[data-src="codex"] { border-color: var(--codex); }
+  .src-panel { display: none; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px 18px; }
+  .src-panel.show { display: block; animation: fade .18s ease; }
+  .kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 14px; margin: 12px 0; font-size: 13.5px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 7px; }
+  .dot.cursor { background: var(--cursor); } .dot.claude { background: var(--claude); } .dot.codex { background: var(--codex); }
+
+  /* architecture layer stack */
+  .stack { display: grid; grid-template-columns: 240px 1fr; gap: 16px; align-items: start; }
+  .layers { display: flex; flex-direction: column; gap: 4px; }
+  .layer { font: inherit; font-size: 13px; text-align: left; color: var(--muted); background: var(--panel);
+    border: 1px solid var(--border); border-left: 3px solid var(--border); border-radius: 6px;
+    padding: 8px 12px; cursor: pointer; }
+  .layer:hover { color: var(--text); }
+  .layer.on { color: var(--head); background: var(--panel2); border-left-color: var(--cursor); }
+  .layer small { display: block; color: var(--muted); font-family: var(--mono); font-size: 10.5px; }
+  .layer-detail { display: none; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px 18px; position: sticky; top: 68px; }
+  .layer-detail.show { display: block; animation: fade .18s ease; }
+  .flow { text-align: center; color: var(--muted); font-size: 11px; line-height: 1; }
+
+  /* command chips */
+  .cmds { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+  .cmd { font-family: var(--mono); font-size: 11.5px; color: var(--muted); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  .cmd:hover { color: var(--text); }
+  .cmd.on { color: var(--head); background: var(--panel2); border-color: var(--codex); }
+  .cmd-detail { display: none; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 16px; }
+  .cmd-detail.show { display: block; animation: fade .18s ease; }
+
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 11px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--head); background: var(--panel); }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12.5px; }
+  @media (max-width: 640px) { .stack { grid-template-columns: 1fr; } .layer-detail { position: static; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Tokens</h1>
+  <p class="tag">A macOS desktop app that answers one question: <em>how much of my AI allowance have I burned, and how much is left?</em> Click a topic to explore.</p>
+
+  <nav class="nav">
+    <button class="on" data-go="overview">Overview</button>
+    <button data-go="features">Features</button>
+    <button data-go="sources">Sources</button>
+    <button data-go="arch">Architecture</button>
+    <button data-go="design">Design</button>
+    <button data-go="commands">Commands</button>
+    <button data-go="stack">Stack &amp; Infra</button>
+  </nav>
+
+  <!-- ================= OVERVIEW ================= -->
+  <section class="page show" id="overview">
+    <h2>What it is</h2>
+    <p class="lede">Everything is local — no accounts, no cloud sync, no telemetry.</p>
+    <p>Tokens watches the three agentic coding tools on this Mac — <strong><span class="dot cursor"></span>Cursor</strong>, <strong><span class="dot claude"></span>Claude Code</strong>, and <strong><span class="dot codex"></span>Codex</strong> — reads their local logs, normalizes everything into one canonical format, and shows the result in a dashboard window plus an always-on menu bar indicator.</p>
+    <p>Beyond historical totals, each source's <em>live allowance window</em> (the 5-hour Claude session, the 7-day week, the Cursor billing month) is polled continuously. When usage crosses a line you set, the app fires a macOS notification and offers to generate a <strong>handoff brief</strong> so work can move to another tool before the well runs dry.</p>
+    <p>The only network calls are to Cursor's own APIs, with the user's own credentials, for Cursor data only.</p>
+
+    <h3>The numbers</h3>
+    <table>
+      <tbody>
+        <tr><td><strong>3</strong></td><td>source adapters — one per tool, each failing independently of the others</td></tr>
+        <tr><td><strong>15</strong></td><td>Tauri commands — the entire surface React can call (see Commands)</td></tr>
+        <tr><td><strong>4</strong></td><td>events pushed to the UI — <code>usage-imported</code>, <code>quotas-updated</code>, <code>threshold-alerts</code>, <code>threshold-handoff-copied</code></td></tr>
+        <tr><td><strong>60s</strong></td><td>quota poll interval — cheap allowance checks, no full log walk</td></tr>
+        <tr><td><strong>30d</strong></td><td>rolling dashboard window — never all-time grand totals</td></tr>
+        <tr><td><strong>0</strong></td><td>floating-point money or percentages — everything is integer arithmetic</td></tr>
+      </tbody>
+    </table>
+
+    <h3>How data flows</h3>
+    <pre><code>discovery → source adapter → UsageRecordDraft → normalizer/validator
+          → repository → Tauri command → React</code></pre>
+    <p>Each stage fails independently — an unimplemented adapter, a file that vanished mid-scan, a malformed entry — and the per-source report says exactly what happened, with failures capped at 10 so a broken tree can't flood the UI.</p>
+  </section>
+
+  <!-- ================= FEATURES ================= -->
+  <section class="page" id="features">
+    <h2>Features</h2>
+    <p class="lede">Click a feature to open it.</p>
+
+    <div class="acc open">
+      <button class="acc-head">Dashboard <span class="hint">— the main window</span><span class="caret">▶</span></button>
+      <div class="acc-body">
+        <p>A dark, single-window UI reporting on a <strong>rolling 30-day window</strong>:</p>
+        <ul>
+          <li><strong>Stat bar</strong> — total tokens, input/output/cached/reasoning splits, cost when reported.</li>
+          <li><strong>Source strip</strong> — one card per tool; click to filter the whole dashboard.</li>
+          <li><strong>Model breakdown</strong> — usage grouped by model across all sources.</li>
+          <li><strong>Event list</strong> — the most recent individual usage records, newest first.</li>
+          <li><strong>Quota chips</strong> — e.g. <code>claude code · 49% left this session</code>, showing whichever window binds first.</li>
+        </ul>
+        <p>Empty states distinguish "nothing imported yet" from "nothing matched the filter"; the footer reports records excluded from date-filtered views for unresolvable timestamps.</p>
+      </div>
+    </div>
+
+    <div class="acc">
+      <button class="acc-head">Menu bar indicator <span class="hint">— always on</span><span class="caret">▶</span></button>
+      <div class="acc-body">
+        <p>A status item showing the compact total plus one allowance chip per source: <code>302K · claude 49% · codex 63%</code>.</p>
+        <p>When a source meters several windows at once (Claude runs a 5-hour session inside a 7-day week), the bar shows only <strong>the window that binds first</strong> — the number that decides whether you can keep working. The dropdown lists every window with reset times, plus totals and per-source breakdowns. It reads the same repository as the window, so the two can never disagree.</p>
+      </div>
+    </div>
+
+    <div class="acc">
+      <button class="acc-head">Allowance tracking <span class="hint">— live quotas, not estimates</span><span class="caret">▶</span></button>
+      <div class="acc-body">
+        <p>A quota is not a locally reconstructed total — it is <strong>the source's own statement</strong> of window consumption, freshest snapshot wins:</p>
+        <ul>
+          <li><span class="dot claude"></span><strong>Claude Code</strong> — <code>~/.claude.json</code> → <code>cachedUsageUtilization</code>: 5-hour session, 7-day week, per-model weekly caps where the plan has them.</li>
+          <li><span class="dot codex"></span><strong>Codex</strong> — <code>rate_limits</code> on <code>token_count</code> events; freshest across the 10 most recently modified rollout files.</li>
+          <li><span class="dot cursor"></span><strong>Cursor</strong> — <code>GetCurrentPeriodUsage</code> on <code>api2.cursor.sh</code> (the endpoint Cursor's billing UI uses), with a local last-good cache when offline.</li>
+        </ul>
+        <p>Polled every <strong>60 seconds</strong> — much cheaper than a log import, so warnings stay timely.</p>
+      </div>
+    </div>
+
+    <div class="acc">
+      <button class="acc-head">Threshold alerts <span class="hint">— notifications + banner</span><span class="caret">▶</span></button>
+      <div class="acc-body">
+        <p>Per-source thresholds in two flavors: <strong>remaining percent</strong> (warn at 25% left) or <strong>minutes until reset</strong>. On a crossing the app:</p>
+        <ul>
+          <li>Fires a <strong>macOS notification</strong> with action buttons <em>Generate handoff MD file</em> / <em>Continue</em> (via <code>notify-rust</code> — Tauri's plugin doesn't forward actions on macOS).</li>
+          <li>Shows an <strong>in-app banner</strong> with the same actions.</li>
+        </ul>
+        <p><em>Continue</em> snoozes until the window resets. An in-process ledger dedupes (one notification per crossing per run) and prunes stale entries when windows reset or usage recovers.</p>
+      </div>
+    </div>
+
+    <div class="acc">
+      <button class="acc-head">Handoff flow <span class="hint">— the signature move</span><span class="caret">▶</span></button>
+      <div class="acc-body">
+        <p>When a tool is about to run dry, <strong>Create handoff</strong> copies a fixed prompt to the clipboard. Paste it into the still-alive agent and it writes <code>.handoff/HANDOFF.md</code> — goal, done so far, current state, next actions, do-nots, open questions — so work resumes in a different tool.</p>
+        <p>The prompt lives in the Rust domain (<code>HANDOFF_PROMPT</code>) and is served to React via a command, so both sides share exactly one string.</p>
+      </div>
+    </div>
+
+    <div class="acc">
+      <button class="acc-head">Cursor dashboard connection <span class="hint">— authoritative data</span><span class="caret">▶</span></button>
+      <div class="acc-body">
+        <p>Cursor's local logs stopped carrying reliable token counts around January 2026. The fix: paste the <code>WorkosCursorSessionToken</code> cookie from cursor.com/dashboard in Settings. The app validates it against the real API, stores it in <strong>macOS Keychain</strong>, then rebuilds Cursor usage from <code>get-filtered-usage-events</code> — exact input, output, cache tokens, model, and <strong>billed cost</strong> for 30 days.</p>
+        <p>Disconnecting wipes the credential and falls back to incomplete local bubbles. Either change clears the store and re-imports everything.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= SOURCES ================= -->
+  <section class="page" id="sources">
+    <h2>Sources</h2>
+    <p class="lede">Where each tool's usage actually lives. Click a source.</p>
+
+    <div class="tabs">
+      <button class="on" data-src="cursor"><span class="dot cursor"></span>Cursor</button>
+      <button data-src="claude"><span class="dot claude"></span>Claude Code</button>
+      <button data-src="codex"><span class="dot codex"></span>Codex</button>
+    </div>
+
+    <div class="src-panel show" id="src-cursor">
+      <dl class="kv">
+        <dt>logs</dt><dd><code>~/Library/Application Support/Cursor/User/globalStorage/state.vscdb</code> (VS Code state SQLite DB)</dd>
+        <dt>format</dt><dd><code>cursorDiskKV</code> rows keyed <code>bubbleId:&lt;conversationId&gt;:&lt;bubbleId&gt;</code> → JSON bubbles</dd>
+        <dt>adapter</dt><dd><code>cursor</code> v0.3.0</dd>
+        <dt>quota</dt><dd><code>GetCurrentPeriodUsage</code> on <code>api2.cursor.sh</code>, bearer token from <code>ItemTable</code>; last-good cache on disk when offline</dd>
+      </dl>
+      <p><strong>Two eras coexist.</strong> Pre-2026 assistant bubbles carry real <code>tokenCount</code> + a unique <code>usageUuid</code> — imported as token-bearing records. Newer bubbles are zeroed, so user turns with <code>modelInfo</code>/<code>requestId</code> become token-<em>unknown</em> activity events. Historical totals survive without double-counting, and recent activity stays visible.</p>
+      <p>When the dashboard is connected, paginated remote events (500/page, 30-day window) replace local bubbles entirely — with billed cost attached.</p>
+    </div>
+
+    <div class="src-panel" id="src-claude">
+      <dl class="kv">
+        <dt>logs</dt><dd><code>~/.claude/projects/&lt;slugified-cwd&gt;/</code> — one JSONL transcript per session, walked recursively</dd>
+        <dt>format</dt><dd><code>assistant</code> lines carrying <code>message.usage</code> (input, output, cache-creation, cache-read)</dd>
+        <dt>adapter</dt><dd><code>claude_code</code> v0.3.0; provider fixed to <code>anthropic</code></dd>
+        <dt>quota</dt><dd><code>~/.claude.json</code> → <code>cachedUsageUtilization</code>: 5h session + 7d week (+ Opus/Sonnet weekly caps), with a limit-hit fallback</dd>
+      </dl>
+      <p><strong>Streaming writes snapshots.</strong> The same <code>message.id</code> appears on several lines as a message grows; only the last snapshot per message counts, and the globally unique id doubles as the dedupe identity. Subagent transcripts nest deeper (<code>&lt;session&gt;/subagents/</code>) and their usage appears nowhere else — hence the recursive walk.</p>
+      <p>Cache-creation tokens are summed into input (priced as premium input); cache reads stay separate. No cost reported.</p>
+    </div>
+
+    <div class="src-panel" id="src-codex">
+      <dl class="kv">
+        <dt>logs</dt><dd><code>~/.codex/sessions/YYYY/MM/DD/</code> + <code>~/.codex/archived_sessions/</code></dd>
+        <dt>format</dt><dd><code>token_count</code> events carrying <code>last_token_usage</code>; model from <code>turn_context</code>, provider from <code>session_meta</code></dd>
+        <dt>adapter</dt><dd><code>codex</code> v0.2.0</dd>
+        <dt>quota</dt><dd>freshest <code>rate_limits.primary</code> window across the 10 most recently modified rollouts</dd>
+      </dl>
+      <p><strong>Append-only means stable identity.</strong> The n-th <code>token_count</code> event in a rollout is a durable ID: <code>{rollout_id}:{n}</code>. Re-imports and the sessions/archived overlap deduplicate on it.</p>
+      <p>Session files are named for when a session <em>started</em>, so modification time — not the path — is the honest recency signal for quota scans. No cost reported.</p>
+    </div>
+  </section>
+
+  <!-- ================= ARCHITECTURE ================= -->
+  <section class="page" id="arch">
+    <h2>Architecture</h2>
+    <p class="lede">Strict one-way layering — each layer depends only on the ones below it. Click a layer.</p>
+
+    <div class="stack">
+      <div class="layers">
+        <button class="layer on" data-layer="commands">commands<small>commands.rs</small></button>
+        <div class="flow">▼</div>
+        <button class="layer" data-layer="state">state<small>state.rs</small></button>
+        <div class="flow">▼</div>
+        <button class="layer" data-layer="runtime">refresh · alerts · menubar · prefs<small>refresh.rs …</small></button>
+        <div class="flow">▼</div>
+        <button class="layer" data-layer="pipeline">pipeline<small>pipeline.rs</small></button>
+        <div class="flow">▼</div>
+        <button class="layer" data-layer="repository">repository<small>repository/</small></button>
+        <div class="flow">▼</div>
+        <button class="layer" data-layer="normalize">normalize<small>normalize/</small></button>
+        <div class="flow">▼</div>
+        <button class="layer" data-layer="adapters">adapters<small>adapters/</small></button>
+        <div class="flow">▼</div>
+        <button class="layer" data-layer="domain">domain<small>domain/</small></button>
+      </div>
+
+      <div>
+        <div class="layer-detail show" id="ld-commands">
+          <h3>commands — the only surface React can call</h3>
+          <p>15 Tauri commands, deliberately thin: accept a request, delegate, convert failures into <code>AppError</code>. No aggregation or parsing logic lives here. Also owns date-range validation (end must be after start).</p>
+        </div>
+        <div class="layer-detail" id="ld-state">
+          <h3>state — what the running app holds</h3>
+          <p>The repository behind its trait, freshest quota snapshots (account state, kept out of the usage store), user options + their path, and the alert ledger — all behind <code>RwLock</code>/<code>Mutex</code> for the background threads. Commands see the repository only through the trait, so swapping in SQLite touches this file and nothing else.</p>
+        </div>
+        <div class="layer-detail" id="ld-runtime">
+          <h3>refresh · alerts · menubar · prefs — the runtime crew</h3>
+          <p><strong>refresh</strong> orchestrates one import pass per adapter with per-stage failure isolation, and the cheap quotas-only poll. <strong>alerts</strong> owns delivery: the fired/snoozed ledger, OS notifications with action buttons, and the <code>threshold-alerts</code> event. <strong>menubar</strong> repaints the tray after every import and poll. <strong>prefs</strong> persists <code>options.json</code> atomically (temp file + rename).</p>
+        </div>
+        <div class="layer-detail" id="ld-pipeline">
+          <h3>pipeline — drafts in, stored records out</h3>
+          <p>Joins normalizer to repository. Rejected drafts are <em>reported, not raised</em>: one malformed entry never discards the entries around it. The import report (inserted / duplicates skipped / rejected) reaches the UI in full.</p>
+        </div>
+        <div class="layer-detail" id="ld-repository">
+          <h3>repository — storage behind one trait</h3>
+          <p>Idempotent <code>insert_batch</code> (re-importing the same log is a no-op), <code>summary</code>, <code>recent</code>, <code>count</code>, <code>clear</code>. In-memory today; the deliberately narrow trait is what lets a SQLite backend replace it without touching the layers above.</p>
+        </div>
+        <div class="layer-detail" id="ld-normalize">
+          <h3>normalize — the only producer of valid records</h3>
+          <p>A pure function (clock injected) that validates drafts, computes SHA-256 dedupe keys and record IDs, resolves timestamps, and stamps <code>imported_at</code>. Everything downstream — repository, commands, React — assumes the invariants checked here already hold.</p>
+        </div>
+        <div class="layer-detail" id="ld-adapters">
+          <h3>adapters — one per source, drafts only</h3>
+          <p>Turn each tool's logs into <code>UsageRecordDraft</code>s. An adapter never validates, deduplicates, or stores, and never knows about other sources — that isolation is what lets one malformed log fail without affecting the rest. Filesystem paths stay inside the adapter behind opaque <code>source_ref</code> handles.</p>
+        </div>
+        <div class="layer-detail" id="ld-domain">
+          <h3>domain — shared vocabulary, depends on nothing</h3>
+          <p><code>UsageRecord</code>, <code>TokenField</code>, <code>Money</code>, <code>UsageQuota</code>, <code>AppOptions</code>, threshold alert evaluation, and the <code>HANDOFF_PROMPT</code>. Every other layer points here; it points nowhere.</p>
+        </div>
+      </div>
+    </div>
+
+    <h3>Frontend structure</h3>
+    <ul>
+      <li><code>src/domain/usage.ts</code> — TypeScript mirroring the Rust domain; changed only alongside the Rust types.</li>
+      <li><code>src/api/*.ts</code> — the <strong>only</strong> modules that call <code>invoke</code>.</li>
+      <li><code>src/hooks/</code> — <code>useUsageDashboard</code> (data + refresh + event subscriptions, stale-request and unmount guards), <code>useOptions</code>, <code>useThresholdAlerts</code>.</li>
+      <li><code>src/components/</code> — <code>StatBar</code>, <code>SourceStrip</code>, <code>ModelBreakdown</code>, <code>EventList</code>, <code>AlertBanner</code>, <code>SettingsView</code>, <code>AppMenu</code>, <code>Skeletons</code>.</li>
+      <li><code>src/theme.ts</code> — one hue per source on near-black; nothing else is colored, so color always means data.</li>
+    </ul>
+  </section>
+
+  <!-- ================= DESIGN ================= -->
+  <section class="page" id="design">
+    <h2>Design decisions</h2>
+    <p class="lede">The opinionated choices that make the app trustworthy. Click to open.</p>
+
+    <div class="acc open">
+      <button class="acc-head">Unknown is not zero<span class="caret">▶</span></button>
+      <div class="acc-body"><p>Every token category is a <code>TokenField { value, quality }</code> pair (<code>exact</code> / <code>estimated</code> / <code>partial</code> / <code>unknown</code>). A <code>null</code> means "not reported", never zero — totals mark themselves as lower bounds (<code>unknownRecords &gt; 0</code>) instead of silently undercounting.</p></div>
+    </div>
+    <div class="acc">
+      <button class="acc-head">Money never becomes a float<span class="caret">▶</span></button>
+      <div class="acc-body"><p>Amounts are integer minor units with currency and exponent (<code>{ amount_minor, "USD", 6 }</code> = micro-dollars); exponents up to 6 allow per-million-token pricing. All formatting — even in the menu bar — is integer arithmetic. Cost totals never mix currencies.</p></div>
+    </div>
+    <div class="acc">
+      <button class="acc-head">Deterministic dedupe<span class="caret">▶</span></button>
+      <div class="acc-body"><p>Keys are SHA-256 over the source's own event ID (or observable content when no ID exists), deliberately <strong>excluding adapter version and import time</strong> — upgrading an adapter can't resurrect imported records. The record ID derives from the key, so the same event always resolves to the same ID.</p></div>
+    </div>
+    <div class="acc">
+      <button class="acc-head">Reproducible normalization<span class="caret">▶</span></button>
+      <div class="acc-body"><p>Clock passed in as a parameter. Zone-less timestamps read as UTC, not the Mac's local zone. An unparsable timestamp doesn't reject a record; date-filtered queries skip undated records and report how many were skipped.</p></div>
+    </div>
+    <div class="acc">
+      <button class="acc-head">Honest totals<span class="caret">▶</span></button>
+      <div class="acc-body"><p>Display totals prefer a source-reported total, else input + output (+ reasoning when reported). Cached input is excluded (sources report it as a component of input). Every total carries the rule that produced it, so the UI never guesses comparability.</p></div>
+    </div>
+    <div class="acc">
+      <button class="acc-head">Quota freshness shown, not faked<span class="caret">▶</span></button>
+      <div class="acc-body"><p>Every snapshot carries <code>observed_at</code>; quota goes stale within minutes, so the UI can show age rather than pretend it's live. Percentages are integer tenths (930 = 93.0%), like money.</p></div>
+    </div>
+    <div class="acc">
+      <button class="acc-head">Paths never leak<span class="caret">▶</span></button>
+      <div class="acc-body"><p><code>source_ref</code> is an opaque adapter-owned handle; provenance records adapter id/version plus that handle — never filesystem paths, prompts, or responses.</p></div>
+    </div>
+
+    <h3>Security &amp; privacy</h3>
+    <ul>
+      <li>Cursor dashboard session token lives only in <strong>macOS Keychain</strong> (<code>com.josep.tokens</code>).</li>
+      <li>Cursor's local access token is read from <code>state.vscdb</code>, held in memory, sent only to <code>api2.cursor.sh</code>, never logged or cached.</li>
+      <li>The on-disk quota cache holds percentages and reset times only — no credentials.</li>
+      <li>Fully offline otherwise: no analytics, no external calls beyond Cursor's own APIs for Cursor data.</li>
+    </ul>
+
+    <h3>Startup &amp; runtime</h3>
+    <ul>
+      <li>Load <code>options.json</code> (defaults: warn at 25% remaining on every source).</li>
+      <li>Request notification permission up front so the first crossing can notify.</li>
+      <li>Initial import runs on a <strong>background thread</strong> — hundreds of MB of logs, too slow to block the window; the UI fills in when <code>usage-imported</code> lands.</li>
+      <li>A <strong>60-second quota loop</strong>: refresh → emit <code>quotas-updated</code> → repaint menu bar → evaluate alerts.</li>
+    </ul>
+    <p>Usage records live in memory per process (re-imported on launch); options persist as JSON. The repository trait is the seam for a future SQLite backend.</p>
+  </section>
+
+  <!-- ================= COMMANDS ================= -->
+  <section class="page" id="commands">
+    <h2>Commands</h2>
+    <p class="lede">The entire Tauri surface React can call. Click one.</p>
+
+    <div class="cmds">
+      <button class="cmd on" data-cmd="usage_summary">usage_summary</button>
+      <button class="cmd" data-cmd="recent_usage">recent_usage</button>
+      <button class="cmd" data-cmd="usage_record_count">usage_record_count</button>
+      <button class="cmd" data-cmd="usage_sources">usage_sources</button>
+      <button class="cmd" data-cmd="usage_quota">usage_quota</button>
+      <button class="cmd" data-cmd="refresh_logs">refresh_logs</button>
+      <button class="cmd" data-cmd="get_options">get_options</button>
+      <button class="cmd" data-cmd="set_options">set_options</button>
+      <button class="cmd" data-cmd="cursor_connection_status">cursor_connection_status</button>
+      <button class="cmd" data-cmd="connect_cursor_dashboard">connect_cursor_dashboard</button>
+      <button class="cmd" data-cmd="disconnect_cursor_dashboard">disconnect_cursor_dashboard</button>
+      <button class="cmd" data-cmd="active_alerts">active_alerts</button>
+      <button class="cmd" data-cmd="snooze_alert">snooze_alert</button>
+      <button class="cmd" data-cmd="handoff_prompt">handoff_prompt</button>
+      <button class="cmd" data-cmd="test_notification">test_notification</button>
+    </div>
+
+    <div class="cmd-detail show" id="cd-usage_summary"><strong>usage_summary</strong> — totals and per-source/per-model breakdowns for the dashboard, filtered by source/model/date range.</div>
+    <div class="cmd-detail" id="cd-recent_usage"><strong>recent_usage</strong> — the most recent usage records, newest first, same filters as the summary.</div>
+    <div class="cmd-detail" id="cd-usage_record_count"><strong>usage_record_count</strong> — total records in the store; lets the UI tell an empty store apart from a filter that matched nothing.</div>
+    <div class="cmd-detail" id="cd-usage_sources"><strong>usage_sources</strong> — the three adapters with version and a <code>readsLogs</code> flag, so the dashboard can say "live" vs "soon".</div>
+    <div class="cmd-detail" id="cd-usage_quota"><strong>usage_quota</strong> — the freshest quota snapshot per source; empty until the first refresh completes.</div>
+    <div class="cmd-detail" id="cd-refresh_logs"><strong>refresh_logs</strong> — the manual import: rescan every source, import what's new, repaint the tray, re-evaluate alerts. Per-source failures ride inside the report.</div>
+    <div class="cmd-detail" id="cd-get_options"><strong>get_options</strong> — current user options (per-source thresholds).</div>
+    <div class="cmd-detail" id="cd-set_options"><strong>set_options</strong> — normalize, validate, persist to <code>options.json</code>, replace in state, then re-evaluate alerts against the new lines.</div>
+    <div class="cmd-detail" id="cd-cursor_connection_status"><strong>cursor_connection_status</strong> — whether an authenticated Cursor dashboard session exists in Keychain.</div>
+    <div class="cmd-detail" id="cd-connect_cursor_dashboard"><strong>connect_cursor_dashboard</strong> — validate the session token with a one-event probe, save it to Keychain, then clear the store and rebuild Cursor usage from authoritative remote events.</div>
+    <div class="cmd-detail" id="cd-disconnect_cursor_dashboard"><strong>disconnect_cursor_dashboard</strong> — delete the credential, clear the store, and rebuild from local bubble data.</div>
+    <div class="cmd-detail" id="cd-active_alerts"><strong>active_alerts</strong> — threshold crossings that are neither snoozed nor reset, for the in-app banner.</div>
+    <div class="cmd-detail" id="cd-snooze_alert"><strong>snooze_alert</strong> — the Continue action: silence this alert until its window resets.</div>
+    <div class="cmd-detail" id="cd-handoff_prompt"><strong>handoff_prompt</strong> — the fixed prompt (shared Rust↔React) the UI copies to the clipboard for a HANDOFF.md brief.</div>
+    <div class="cmd-detail" id="cd-test_notification"><strong>test_notification</strong> — fire a sample OS notification so Settings can preview the alert look.</div>
+
+    <h3>Events pushed to React</h3>
+    <table>
+      <tbody>
+        <tr><td><code>usage-imported</code></td><td>startup (or reconnect) import finished — fill the empty UI</td></tr>
+        <tr><td><code>quotas-updated</code></td><td>60s poll — patch quotas in place without re-fetching aggregations</td></tr>
+        <tr><td><code>threshold-alerts</code></td><td>active alert set changed — update the banner</td></tr>
+        <tr><td><code>threshold-handoff-copied</code></td><td>handoff prompt copied — confirm in the banner</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ================= STACK & INFRA ================= -->
+  <section class="page" id="stack">
+    <h2>Stack &amp; Infrastructure</h2>
+    <p class="lede">Tauri 2 + React 19 + Rust, macOS only.</p>
+
+    <h3>Desktop shell &amp; backend</h3>
+    <ul>
+      <li><strong>Tauri 2</strong> (tray-icon feature), <code>tauri-plugin-opener</code>, <code>tauri-plugin-notification</code></li>
+      <li><strong>Rust</strong> 2021: <code>serde</code>/<code>serde_json</code>, <code>chrono</code> + <code>chrono-tz</code>, <code>thiserror</code>, <code>sha2</code> + <code>hex</code> (dedupe keys), <code>rusqlite</code> 0.40 bundled (Cursor's <code>state.vscdb</code>), <code>reqwest</code> 0.13 blocking + rustls (Cursor API), <code>keyring</code> 4.1 (Keychain), <code>notify-rust</code> 4 (action-button notifications)</li>
+    </ul>
+
+    <h3>Frontend</h3>
+    <ul>
+      <li><strong>React 19</strong> + <strong>TypeScript</strong> 5.8, <strong>Vite</strong> 7, plain CSS</li>
+      <li><code>@tauri-apps/api</code> for commands + event subscriptions</li>
+    </ul>
+
+    <h3>Tooling</h3>
+    <ul>
+      <li><strong>pnpm</strong> workspaces; <code>cargo test</code> throughout the crate — adapters use path-injecting constructors and fixture modes so tests never touch real logs, Keychain, or network.</li>
+    </ul>
+
+    <h3>Packaging</h3>
+    <table>
+      <tbody>
+        <tr><td>platform</td><td>macOS only (Apple Silicon dev), dark theme, window 900×680 (min 620×420)</td></tr>
+        <tr><td>bundle id</td><td><code>com.josep.tokens</code></td></tr>
+        <tr><td>outputs</td><td><code>src-tauri/target/release/bundle/macos/Tokens.app</code> + DMG; verification copy at <code>dist-app/Tokens.app</code></td></tr>
+        <tr><td>signing</td><td>unsigned/unnotarized — fine on this Mac; required before other Macs</td></tr>
+        <tr><td>permissions</td><td><code>core:default</code>, <code>opener:default</code>, <code>notification:default</code>; runtime notification prompt</td></tr>
+        <tr><td>writes</td><td><code>options.json</code> + <code>cursor-usage-cache.json</code> in the app config dir — nothing else</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Status</h3>
+    <p>Every phase in <code>PLAN.md</code> is complete: all three adapters are live, fixtures survive only in tests, the dashboard reads real logs. Next up per the plan: a persistent SQLite store behind the repository trait, and signing/notarization for distribution. Deferred so far: automatic log watching, cloud sync, iOS.</p>
+
+    <h3>Useful commands</h3>
+    <pre><code>pnpm install
+pnpm tauri dev        # development window
+pnpm tauri build      # standalone macOS .app + DMG
+cd src-tauri &amp;&amp; cargo test   # Rust unit tests</code></pre>
+  </section>
+
+  <footer>Tokens · local AI token-usage tracker for macOS · Tauri 2 + React 19 + Rust</footer>
+</div>
+
+<script>
+  const $ = (s, c) => (c || document).querySelector(s);
+  const $$ = (s, c) => Array.from((c || document).querySelectorAll(s));
+
+  // Top nav: show one section at a time.
+  $$('.nav button').forEach(function (b) {
+    b.onclick = function () {
+      $$('.nav button').forEach(function (x) { x.classList.toggle('on', x === b); });
+      $$('section.page').forEach(function (s) { s.classList.toggle('show', s.id === b.dataset.go); });
+    };
+  });
+
+  // Accordions: features + design decisions.
+  $$('.acc-head').forEach(function (h) {
+    h.onclick = function () { h.parentElement.classList.toggle('open'); };
+  });
+
+  // Source tabs.
+  $$('.tabs button').forEach(function (t) {
+    t.onclick = function () {
+      $$('.tabs button').forEach(function (x) { x.classList.toggle('on', x === t); });
+      $$('.src-panel').forEach(function (p) { p.classList.toggle('show', p.id === 'src-' + t.dataset.src); });
+    };
+  });
+
+  // Architecture layer stack.
+  $$('.layer').forEach(function (l) {
+    l.onclick = function () {
+      $$('.layer').forEach(function (x) { x.classList.toggle('on', x === l); });
+      const d = $('#ld-' + l.dataset.layer);
+      $$('.layer-detail').forEach(function (x) { x.classList.toggle('show', x === d); });
+    };
+  });
+
+  // Command explorer.
+  $$('.cmd').forEach(function (c) {
+    c.onclick = function () {
+      $$('.cmd').forEach(function (x) { x.classList.toggle('on', x === c); });
+      const d = $('#cd-' + c.dataset.cmd);
+      $$('.cmd-detail').forEach(function (x) { x.classList.toggle('show', x === d); });
+    };
+  });
+</script>
+</body>
+</html>

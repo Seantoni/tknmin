@@ -23,7 +23,10 @@ pub enum FieldQuality {
 impl FieldQuality {
     /// Whether a value with this quality may be added into a displayed total.
     pub fn is_countable(self) -> bool {
-        matches!(self, FieldQuality::Exact | FieldQuality::Estimated | FieldQuality::Partial)
+        matches!(
+            self,
+            FieldQuality::Exact | FieldQuality::Estimated | FieldQuality::Partial
+        )
     }
 }
 
@@ -46,7 +49,10 @@ pub enum TimestampInterpretation {
 impl TimestampInterpretation {
     /// Whether the normalized instant is safe to use for range filtering.
     pub fn is_resolved(self) -> bool {
-        !matches!(self, TimestampInterpretation::Unparsable | TimestampInterpretation::Missing)
+        !matches!(
+            self,
+            TimestampInterpretation::Unparsable | TimestampInterpretation::Missing
+        )
     }
 }
 

@@ -9,6 +9,8 @@
 import type {
   FieldQuality,
   Money,
+  SourceApp,
+  SourceSyncHealth,
   TimestampInterpretation,
   TokenField,
   TokenTotal,
@@ -201,6 +203,72 @@ export function tightestQuotaPerSource(quotas: UsageQuota[]): UsageQuota[] {
   return [...tightest.values()];
 }
 
+/** Every window one source meters, kept together under that source. */
+export interface QuotaGroup {
+  sourceApp: SourceApp;
+  windows: UsageQuota[];
+}
+
+/**
+ * Every allowance window there is, grouped by the source it belongs to rather
+ * than collapsed to one number per source.
+ *
+ * The header chip and the menu bar have room for a single number and so show the
+ * window that binds first. A list has room for all of them, and they are not
+ * interchangeable: Claude's 5-hour session and its 7-day week run out on their
+ * own schedules, its per-model caps are separate pools inside the week, and
+ * Cursor's own models cannot spend what is left of the others. Grouping is what
+ * keeps those readable — two lines about Cursor have to look like Cursor's.
+ *
+ * Sources come in order of how close they are to running out, and a source's own
+ * windows come shortest-first — the session before the week that contains it.
+ */
+export function quotaGroups(quotas: UsageQuota[]): QuotaGroup[] {
+  const groups = new Map<SourceApp, UsageQuota[]>();
+  for (const quota of quotas) {
+    const windows = groups.get(quota.sourceApp);
+    if (windows === undefined) groups.set(quota.sourceApp, [quota]);
+    else windows.push(quota);
+  }
+
+  for (const windows of groups.values()) {
+    windows.sort((left, right) => {
+      if (left.windowMinutes !== right.windowMinutes) {
+        return left.windowMinutes - right.windowMinutes;
+      }
+      return (left.label ?? "").localeCompare(right.label ?? "");
+    });
+  }
+
+  return [...groups.entries()]
+    .map(([sourceApp, windows]) => ({ sourceApp, windows }))
+    .sort((left, right) => tightestRemaining(left.windows) - tightestRemaining(right.windows));
+}
+
+function tightestRemaining(quotas: UsageQuota[]): number {
+  return Math.min(...quotas.map(quotaRemainingTenths));
+}
+
+/** Identifies one window of one pool: a source, its label, and its length. */
+export function quotaRowKey(quota: UsageQuota): string {
+  return `${quota.sourceApp}:${quota.label ?? ""}:${quota.windowMinutes}`;
+}
+
+/**
+ * The window in the fewest characters that still name it: "5h", "week", "31d".
+ * Used where the window has to sit beside the pool it belongs to, and where the
+ * window is all a row has to be called.
+ */
+export function quotaWindowTag(windowMinutes: number): string {
+  const WEEK = 10080;
+  const DAY = 1440;
+  if (windowMinutes === WEEK) return "week";
+  if (windowMinutes === DAY) return "day";
+  if (windowMinutes > DAY && windowMinutes % DAY === 0) return `${windowMinutes / DAY}d`;
+  if (windowMinutes % 60 === 0) return `${windowMinutes / 60}h`;
+  return `${windowMinutes}min`;
+}
+
 /** Every window a source meters, one per line, for a chip's tooltip. */
 export function describeQuotaWindows(quotas: UsageQuota[]): string {
   const lines = quotas
@@ -210,9 +278,9 @@ export function describeQuotaWindows(quotas: UsageQuota[]): string {
       (quota) =>
         `${quota.label === null ? "" : `${quota.label}: `}${formatPercentTenths(
           quotaRemainingTenths(quota),
-        )} left ${describeQuotaWindow(
-          quota.windowMinutes,
-        )} · resets ${formatQuotaReset(quota.resetsAt)}`,
+        )} left ${describeQuotaWindow(quota.windowMinutes)} · ${describeQuotaReset(
+          quota.resetsAt,
+        )}`,
     );
   const observed = quotas[0]?.observedAt;
   if (observed !== undefined) {
@@ -227,10 +295,105 @@ export function formatQuotaReset(resetsAt: string): string {
   return `${shortDateFormat.format(instant)} ${shortTimeFormat.format(instant)}`;
 }
 
+/**
+ * When the window resets, or that it has not started — the two things a reset
+ * time can say. Phrased as a whole clause because both readings have to fit the
+ * same slot in a row.
+ */
+export function describeQuotaReset(resetsAt: string | null): string {
+  return resetsAt === null ? NOT_STARTED : `resets ${formatQuotaReset(resetsAt)}`;
+}
+
+/**
+ * The same, in as few characters as the compact window has room for: the time
+ * alone when the window resets today, the date as well when it does not.
+ */
+export function describeQuotaResetCompact(resetsAt: string | null): string {
+  if (resetsAt === null) return NOT_STARTED;
+  const instant = new Date(resetsAt);
+  if (instant.toDateString() === new Date().toDateString()) {
+    return `resets ${shortTimeFormat.format(instant)}`;
+  }
+  return `resets ${formatQuotaReset(resetsAt)}`;
+}
+
+/** Said of a rolling window nothing has started: the allowance is all there. */
+const NOT_STARTED = "not started";
+
 /** How stale the snapshot is, for the tooltip: "reported Jul 28 12:00". */
 export function formatQuotaObserved(observedAt: string): string {
   const instant = new Date(observedAt);
   return `${shortDateFormat.format(instant)} ${shortTimeFormat.format(instant)}`;
+}
+
+/**
+ * How long ago something happened, in the coarsest unit that still answers
+ * the question: "just now", "40s ago", "6m ago", "3h ago", "2d ago".
+ *
+ * Precision beyond that would be false confidence — nothing on this screen
+ * turns on the difference between 3 and 4 hours old.
+ */
+export function formatAge(instant: string | null, now: Date = new Date()): string {
+  if (instant === null) return "never";
+  const elapsed = now.getTime() - new Date(instant).getTime();
+  if (!Number.isFinite(elapsed)) return UNKNOWN;
+  if (elapsed < 0) return "just now";
+
+  const seconds = Math.floor(elapsed / 1000);
+  if (seconds < 10) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+/**
+ * The one-word state of a source, as the interface says it.
+ *
+ * "watching" rather than "current" for a healthy local source, because that is
+ * the honest description: nothing is being polled, a watcher is in place, and
+ * the number is as fresh as the last thing the source wrote.
+ */
+export function describeSyncState(health: SourceSyncHealth): string {
+  switch (health.state) {
+    case "syncing":
+      return "syncing";
+    case "current":
+      return health.awaitingUpstream ? "awaiting billing" : "watching";
+    case "stale":
+      return "stale";
+    case "offline":
+      return "offline";
+    case "error":
+      return "error";
+    case "unknown":
+      return "not checked";
+  }
+}
+
+/**
+ * The full freshness story for a source, for a tooltip.
+ *
+ * Both clocks appear, because they answer different questions and routinely
+ * disagree: Cursor publishes billing hours after the activity that caused it,
+ * so "app synced 5s ago" and "source reported 3h ago" are both true and only
+ * the pair of them is honest.
+ */
+export function describeSourceFreshness(health: SourceSyncHealth): string {
+  const lines = [
+    `${describeSyncState(health)}`,
+    `app synced ${formatAge(health.appSyncedAt)}`,
+    `source reported ${formatAge(health.sourceObservedAt)}`,
+  ];
+  if (health.awaitingUpstream) {
+    lines.push("activity detected; awaiting billing data");
+  }
+  if (health.lastError !== null) {
+    lines.push(`last error: ${health.lastError}`);
+  }
+  return lines.join(" · ");
 }
 
 /** A caveat about how a timestamp was read, or null when it needs none. */

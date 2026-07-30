@@ -20,7 +20,10 @@ pub use dedupe::DEDUPE_ALGORITHM_VERSION;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NormalizationError {
     #[error("token field `{field}` has no value but is marked as {quality:?}")]
-    InconsistentTokenQuality { field: &'static str, quality: crate::domain::FieldQuality },
+    InconsistentTokenQuality {
+        field: &'static str,
+        quality: crate::domain::FieldQuality,
+    },
     #[error("invalid cost: {0}")]
     InvalidCost(String),
     #[error("cost is marked as computed from pricing but no pricing version was supplied")]
@@ -65,6 +68,7 @@ pub fn normalize_at(
     let cost = normalize_cost(draft.cost.clone())?;
 
     let dedupe_key = dedupe::dedupe_key(&draft);
+    let content_hash = dedupe::content_hash(&draft);
     let id = dedupe::record_id(draft.source_app.as_str(), &dedupe_key);
 
     let raw_timestamp = clean(draft.raw_timestamp.as_deref());
@@ -83,6 +87,8 @@ pub fn normalize_at(
         source_event_id: clean(draft.source_event_id.as_deref()),
         dedupe_key,
         dedupe_algorithm_version: DEDUPE_ALGORITHM_VERSION,
+        content_hash,
+        content_hash_version: dedupe::CONTENT_HASH_VERSION,
         provider: clean(draft.provider.as_deref()),
         model: clean(draft.model.as_deref()),
         tokens: draft.tokens,
@@ -102,7 +108,10 @@ pub fn normalize_batch(drafts: Vec<UsageRecordDraft>) -> NormalizedBatch {
     normalize_batch_at(drafts, Utc::now())
 }
 
-pub fn normalize_batch_at(drafts: Vec<UsageRecordDraft>, imported_at: DateTime<Utc>) -> NormalizedBatch {
+pub fn normalize_batch_at(
+    drafts: Vec<UsageRecordDraft>,
+    imported_at: DateTime<Utc>,
+) -> NormalizedBatch {
     let mut batch = NormalizedBatch::default();
     for (index, draft) in drafts.into_iter().enumerate() {
         let source_app = draft.source_app;
@@ -124,9 +133,15 @@ pub fn normalize_batch_at(drafts: Vec<UsageRecordDraft>, imported_at: DateTime<U
 /// Otherwise input and output are summed, plus reasoning when it is reported
 /// separately. Cached input is excluded: sources generally report it as a
 /// component of input, so adding it would double count.
-fn compute_display_total(tokens: &TokenCounts, reported_total: Option<u64>) -> Option<DisplayTotal> {
+fn compute_display_total(
+    tokens: &TokenCounts,
+    reported_total: Option<u64>,
+) -> Option<DisplayTotal> {
     if let Some(tokens) = reported_total {
-        return Some(DisplayTotal { tokens, rule: TotalRule::ReportedBySource });
+        return Some(DisplayTotal {
+            tokens,
+            rule: TotalRule::ReportedBySource,
+        });
     }
 
     let input = tokens.input.countable();
@@ -141,7 +156,10 @@ fn compute_display_total(tokens: &TokenCounts, reported_total: Option<u64>) -> O
             tokens: base.saturating_add(reasoning),
             rule: TotalRule::InputPlusOutputPlusReasoning,
         }),
-        None => Some(DisplayTotal { tokens: base, rule: TotalRule::InputPlusOutput }),
+        None => Some(DisplayTotal {
+            tokens: base,
+            rule: TotalRule::InputPlusOutput,
+        }),
     }
 }
 
@@ -166,8 +184,12 @@ fn normalize_cost(cost: Option<CostDraft>) -> Result<CostInfo, NormalizationErro
         // Re-run the constructor: a draft may have been deserialized straight
         // from JSON, which bypasses `Money::new`'s validation.
         Some(money) => Some(
-            Money::new(money.amount_minor, &money.currency, money.minor_unit_exponent)
-                .map_err(|error| NormalizationError::InvalidCost(error.to_string()))?,
+            Money::new(
+                money.amount_minor,
+                &money.currency,
+                money.minor_unit_exponent,
+            )
+            .map_err(|error| NormalizationError::InvalidCost(error.to_string()))?,
         ),
         None => None,
     };
@@ -183,18 +205,25 @@ fn normalize_cost(cost: Option<CostDraft>) -> Result<CostInfo, NormalizationErro
         _ => {}
     }
 
-    Ok(CostInfo { amount, status: cost.status, pricing_version })
+    Ok(CostInfo {
+        amount,
+        status: cost.status,
+        pricing_version,
+    })
 }
 
 /// Trim a string field, treating blank as absent.
 fn clean(value: Option<&str>) -> Option<String> {
-    value.map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{FieldQuality, SourceProvenance, TokenField, TimestampInterpretation};
+    use crate::domain::{FieldQuality, SourceProvenance, TimestampInterpretation, TokenField};
 
     fn provenance() -> SourceProvenance {
         SourceProvenance {
@@ -215,7 +244,9 @@ mod tests {
     }
 
     fn import_time() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z").unwrap().with_timezone(&Utc)
+        DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
     }
 
     #[test]
@@ -249,7 +280,10 @@ mod tests {
         let record = normalize_at(draft(), import_time()).unwrap();
         assert_eq!(
             record.display_total,
-            Some(DisplayTotal { tokens: 120, rule: TotalRule::InputPlusOutput })
+            Some(DisplayTotal {
+                tokens: 120,
+                rule: TotalRule::InputPlusOutput
+            })
         );
     }
 
@@ -260,7 +294,10 @@ mod tests {
         let record = normalize_at(draft, import_time()).unwrap();
         assert_eq!(
             record.display_total,
-            Some(DisplayTotal { tokens: 125, rule: TotalRule::InputPlusOutputPlusReasoning })
+            Some(DisplayTotal {
+                tokens: 125,
+                rule: TotalRule::InputPlusOutputPlusReasoning
+            })
         );
     }
 
@@ -271,7 +308,10 @@ mod tests {
         let record = normalize_at(draft, import_time()).unwrap();
         assert_eq!(
             record.display_total,
-            Some(DisplayTotal { tokens: 999, rule: TotalRule::ReportedBySource })
+            Some(DisplayTotal {
+                tokens: 999,
+                rule: TotalRule::ReportedBySource
+            })
         );
     }
 
@@ -280,16 +320,25 @@ mod tests {
         let draft = UsageRecordDraft::new(SourceApp::Codex, provenance());
         let record = normalize_at(draft, import_time()).unwrap();
         assert_eq!(record.display_total, None);
-        assert_eq!(record.timestamp_interpretation, TimestampInterpretation::Missing);
+        assert_eq!(
+            record.timestamp_interpretation,
+            TimestampInterpretation::Missing
+        );
     }
 
     #[test]
     fn rejects_a_value_free_field_marked_exact() {
         let mut draft = draft();
-        draft.tokens.reasoning = TokenField { value: None, quality: FieldQuality::Exact };
+        draft.tokens.reasoning = TokenField {
+            value: None,
+            quality: FieldQuality::Exact,
+        };
         assert!(matches!(
             normalize_at(draft, import_time()),
-            Err(NormalizationError::InconsistentTokenQuality { field: "reasoning", .. })
+            Err(NormalizationError::InconsistentTokenQuality {
+                field: "reasoning",
+                ..
+            })
         ));
     }
 
@@ -300,7 +349,10 @@ mod tests {
             status: CostCalculationStatus::ComputedFromPricing,
             pricing_version: None,
         });
-        assert_eq!(normalize_at(draft, import_time()), Err(NormalizationError::MissingPricingVersion));
+        assert_eq!(
+            normalize_at(draft, import_time()),
+            Err(NormalizationError::MissingPricingVersion)
+        );
     }
 
     #[test]
@@ -319,7 +371,10 @@ mod tests {
     #[test]
     fn a_bad_draft_does_not_stop_the_batch() {
         let mut bad = draft();
-        bad.tokens.input = TokenField { value: None, quality: FieldQuality::Estimated };
+        bad.tokens.input = TokenField {
+            value: None,
+            quality: FieldQuality::Estimated,
+        };
         let batch = normalize_batch_at(vec![draft(), bad, draft()], import_time());
         assert_eq!(batch.records.len(), 2);
         assert_eq!(batch.rejected.len(), 1);

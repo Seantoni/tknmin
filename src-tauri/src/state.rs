@@ -1,7 +1,14 @@
 //! Application state held by Tauri.
 //!
-//! Commands see the repository only through the trait, so swapping the
-//! in-memory backend for SQLite later touches this file and nothing else.
+//! What is *not* here matters as much as what is. There is no quota vector, no
+//! refresh timer, no "last report": quotas and freshness are committed data,
+//! read from the repository at the revision the interface asked for, and
+//! refresh timing belongs to `crate::refresh`. A second copy of either would
+//! be a second thing that can be out of date.
+//!
+//! Commands see the repository through [`UsageReader`] only. The write
+//! capability exists, but this type never holds it — the coordinator was given
+//! the sole production `UsageWriter` when it was built.
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -9,13 +16,14 @@ use std::sync::{Arc, RwLock};
 use crate::alerts::AlertLedger;
 use crate::domain::{AppOptions, UsageQuota};
 use crate::fixtures;
-use crate::repository::{InMemoryUsageRepository, UsageRepository};
+use crate::refresh::RefreshHandle;
+use crate::repository::{InMemoryUsageRepository, UsageReader};
 
 pub struct AppState {
-    repository: Arc<dyn UsageRepository>,
-    /// Freshest quota snapshot per source, replaced on every refresh. Kept
-    /// outside the repository: quota is account state, not usage data.
-    quotas: RwLock<Vec<UsageQuota>>,
+    reader: Arc<dyn UsageReader>,
+    /// The only way anything outside `refresh` can ask for work. Absent in
+    /// tests that exercise queries without a running coordinator.
+    refresh: RwLock<Option<RefreshHandle>>,
     /// User settings (thresholds, …). Path is set once the app config dir is known.
     options: RwLock<AppOptions>,
     options_path: RwLock<Option<PathBuf>>,
@@ -24,61 +32,58 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// An empty store, kept for the life of the process. Logs are imported
-    /// into it after startup by the refresh pass.
+    /// An empty in-memory store. Used by tests; the running application opens
+    /// the persistent one instead.
     pub fn in_memory() -> Self {
-        Self {
-            repository: Arc::new(InMemoryUsageRepository::new()),
-            quotas: RwLock::new(Vec::new()),
-            options: RwLock::new(AppOptions::defaults()),
-            options_path: RwLock::new(None),
-            alerts: AlertLedger::new(),
-        }
+        Self::with_reader(Arc::new(InMemoryUsageRepository::new()))
     }
 
     /// The deterministic fake dataset, kept for integration tests now that the
     /// application itself imports real logs.
     pub fn with_fake_data() -> Self {
+        Self::with_reader(Arc::new(InMemoryUsageRepository::with_records(
+            fixtures::fake_records(),
+        )))
+    }
+
+    pub fn with_reader(reader: Arc<dyn UsageReader>) -> Self {
         Self {
-            repository: Arc::new(InMemoryUsageRepository::with_records(fixtures::fake_records())),
-            quotas: RwLock::new(Vec::new()),
+            reader,
+            refresh: RwLock::new(None),
             options: RwLock::new(AppOptions::defaults()),
             options_path: RwLock::new(None),
             alerts: AlertLedger::new(),
         }
     }
 
-    pub fn with_repository(repository: Arc<dyn UsageRepository>) -> Self {
-        Self {
-            repository,
-            quotas: RwLock::new(Vec::new()),
-            options: RwLock::new(AppOptions::defaults()),
-            options_path: RwLock::new(None),
-            alerts: AlertLedger::new(),
+    /// Read-only access to committed data. There is no writing counterpart on
+    /// purpose: see the module comment.
+    pub fn reader(&self) -> &dyn UsageReader {
+        self.reader.as_ref()
+    }
+
+    /// Hand the coordinator's handle to the application, once, during setup.
+    pub fn attach_refresh(&self, handle: RefreshHandle) {
+        if let Ok(mut current) = self.refresh.write() {
+            *current = Some(handle);
         }
     }
 
-    pub fn repository(&self) -> &dyn UsageRepository {
-        self.repository.as_ref()
+    pub fn refresh(&self) -> Option<RefreshHandle> {
+        self.refresh.read().ok().and_then(|handle| handle.clone())
     }
 
-    /// A shared handle for work off the main thread, like the startup import.
-    pub fn repository_handle(&self) -> Arc<dyn UsageRepository> {
-        Arc::clone(&self.repository)
-    }
-
+    /// The committed quota snapshot. Read through, never cached: the menu bar
+    /// and the alerts must see exactly what the dashboard sees.
     pub fn quotas(&self) -> Vec<UsageQuota> {
-        self.quotas.read().map(|quotas| quotas.clone()).unwrap_or_default()
-    }
-
-    pub fn set_quotas(&self, quotas: Vec<UsageQuota>) {
-        if let Ok(mut current) = self.quotas.write() {
-            *current = quotas;
-        }
+        self.reader.quotas().unwrap_or_default()
     }
 
     pub fn options(&self) -> AppOptions {
-        self.options.read().map(|options| options.clone()).unwrap_or_default()
+        self.options
+            .read()
+            .map(|options| options.clone())
+            .unwrap_or_default()
     }
 
     pub fn set_options_path(&self, path: PathBuf) {

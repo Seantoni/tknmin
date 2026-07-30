@@ -47,7 +47,11 @@ pub struct CostInfo {
 
 impl CostInfo {
     pub fn not_available() -> Self {
-        Self { amount: None, status: CostCalculationStatus::NotAvailable, pricing_version: None }
+        Self {
+            amount: None,
+            status: CostCalculationStatus::NotAvailable,
+            pricing_version: None,
+        }
     }
 }
 
@@ -92,8 +96,15 @@ pub struct UsageRecord {
     pub source_app: SourceApp,
     pub source_event_id: Option<String>,
 
+    /// Identity: which source event this is. Stable across corrections.
     pub dedupe_key: String,
     pub dedupe_algorithm_version: u32,
+
+    /// Content: what this observation of the event said. A later snapshot of
+    /// the same event with a different hash replaces the stored row; the same
+    /// hash is a no-op.
+    pub content_hash: String,
+    pub content_hash_version: u32,
 
     pub provider: Option<String>,
     pub model: Option<String>,

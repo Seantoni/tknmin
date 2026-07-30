@@ -3,6 +3,12 @@
  *
  * Components call these functions rather than `invoke` directly, so command
  * names, argument shapes, and error handling live in one place.
+ *
+ * There is no scan here, and no cadence. The interface does not decide when
+ * data is read — it subscribes to committed revisions and fetches snapshots.
+ * The one exception is {@link syncNow}, which submits a trigger to the
+ * backend's coordinator and is recovery only: the app stays current whether or
+ * not anyone ever calls it.
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -10,9 +16,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AdapterInfo,
   AppError,
+  DashboardSnapshot,
   ErrorCode,
   RecentQuery,
-  RefreshReport,
   SummaryQuery,
   UsageQuota,
   UsageRecord,
@@ -20,17 +26,44 @@ import type {
 } from "../domain/usage";
 
 const COMMANDS = {
+  dashboardSnapshot: "dashboard_snapshot",
   usageSummary: "usage_summary",
   recentUsage: "recent_usage",
   usageRecordCount: "usage_record_count",
-  usageSources: "usage_sources",
+  sourceCapabilities: "source_capabilities",
   usageQuota: "usage_quota",
-  refreshLogs: "refresh_logs",
+  syncNow: "sync_now",
+  windowFocused: "window_focused",
+  isSyncing: "is_syncing",
 } as const;
+
+/** The one event every window listens to. Emitted only after a commit. */
+export const DATA_CHANGED = "data-changed";
 
 export const DEFAULT_RECENT_LIMIT = 50;
 
-/** Totals and breakdowns for the dashboard. */
+/**
+ * Everything a screen renders, at one revision.
+ *
+ * This replaces six independent commands. Six reads can interleave with a
+ * commit; one cannot, which is what stops a stat card and a quota chip from
+ * describing different moments.
+ */
+export function fetchDashboardSnapshot(
+  overview: SummaryQuery,
+  recent: Partial<RecentQuery>,
+): Promise<DashboardSnapshot> {
+  const resolved: RecentQuery = {
+    limit: recent.limit ?? DEFAULT_RECENT_LIMIT,
+    filter: recent.filter ?? {},
+  };
+  return call<DashboardSnapshot>(COMMANDS.dashboardSnapshot, {
+    overview,
+    recent: resolved,
+  });
+}
+
+/** Totals and breakdowns for one filter. */
 export function fetchUsageSummary(query?: SummaryQuery): Promise<UsageSummary> {
   return call<UsageSummary>(COMMANDS.usageSummary, { query: query ?? null });
 }
@@ -49,19 +82,34 @@ export function fetchUsageRecordCount(): Promise<number> {
   return call<number>(COMMANDS.usageRecordCount);
 }
 
-/** The source applications this build knows about. */
-export function fetchUsageSources(): Promise<AdapterInfo[]> {
-  return call<AdapterInfo[]>(COMMANDS.usageSources);
+/** Static facts about the supported sources. Touches no source. */
+export function fetchSourceCapabilities(): Promise<AdapterInfo[]> {
+  return call<AdapterInfo[]>(COMMANDS.sourceCapabilities);
 }
 
-/** Rescan every source's logs on disk and import whatever is new. */
-export function refreshLogs(): Promise<RefreshReport> {
-  return call<RefreshReport>(COMMANDS.refreshLogs);
-}
-
-/** The freshest allowance-window snapshot per source, when reported. */
+/** The freshest committed allowance snapshot per source and window. */
 export function fetchUsageQuota(): Promise<UsageQuota[]> {
   return call<UsageQuota[]>(COMMANDS.usageQuota);
+}
+
+/**
+ * Ask the backend to catch up now.
+ *
+ * Recovery and diagnostics. It submits one trigger and returns immediately;
+ * the result arrives as a `data-changed` event like every other update.
+ */
+export function syncNow(): Promise<void> {
+  return call<void>(COMMANDS.syncNow);
+}
+
+/** Tell the backend a window came forward, so it can submit a catch-up. */
+export function reportWindowFocused(): Promise<void> {
+  return call<void>(COMMANDS.windowFocused);
+}
+
+/** Whether any source is being synchronized right now. */
+export function fetchIsSyncing(): Promise<boolean> {
+  return call<boolean>(COMMANDS.isSyncing);
 }
 
 const ERROR_CODES: readonly ErrorCode[] = ["storage", "adapter", "invalid_request"];

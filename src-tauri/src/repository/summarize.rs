@@ -85,7 +85,11 @@ pub fn take_recent(records: Vec<&UsageRecord>, query: &RecentQuery) -> Vec<Usage
             .then(right_time.cmp(&left_time))
             .then(left_id.cmp(right_id))
     });
-    records.into_iter().take(query.effective_limit()).cloned().collect()
+    records
+        .into_iter()
+        .take(query.effective_limit())
+        .cloned()
+        .collect()
 }
 
 /// Accumulate one record into a set of totals.
@@ -93,9 +97,13 @@ pub fn accumulate(totals: &mut UsageTotals, record: &UsageRecord) {
     totals.record_count += 1;
     totals.input.add(record.tokens.input.countable());
     totals.output.add(record.tokens.output.countable());
-    totals.cached_input.add(record.tokens.cached_input.countable());
+    totals
+        .cached_input
+        .add(record.tokens.cached_input.countable());
     totals.reasoning.add(record.tokens.reasoning.countable());
-    totals.display_total.add(record.display_total.map(|total| total.tokens));
+    totals
+        .display_total
+        .add(record.display_total.map(|total| total.tokens));
     accumulate_cost(&mut totals.cost, record);
 }
 
@@ -105,7 +113,11 @@ fn accumulate_cost(cost: &mut CostTotal, record: &UsageRecord) {
         return;
     };
 
-    match cost.by_currency.iter_mut().find(|entry| entry.amount.currency == amount.currency) {
+    match cost
+        .by_currency
+        .iter_mut()
+        .find(|entry| entry.amount.currency == amount.currency)
+    {
         Some(entry) => {
             // Only an i64 overflow can fail here, which no realistic token
             // spend reaches; the running total is kept rather than poisoned.
@@ -114,9 +126,10 @@ fn accumulate_cost(cost: &mut CostTotal, record: &UsageRecord) {
                 entry.counted_records += 1;
             }
         }
-        None => cost
-            .by_currency
-            .push(CurrencyTotal { amount: amount.clone(), counted_records: 1 }),
+        None => cost.by_currency.push(CurrencyTotal {
+            amount: amount.clone(),
+            counted_records: 1,
+        }),
     }
 }
 
@@ -149,7 +162,10 @@ pub fn summarize<'a>(
             .entry(model_key.clone().unwrap_or_default())
             .or_insert_with(|| GroupSummary {
                 key: model_key,
-                label: record.model.clone().unwrap_or_else(|| "Unknown model".to_string()),
+                label: record
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "Unknown model".to_string()),
                 totals: UsageTotals::default(),
             });
         accumulate(&mut group.totals, record);

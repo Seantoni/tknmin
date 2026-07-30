@@ -38,13 +38,15 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 
 fn current_summary<R: Runtime>(app: &AppHandle<R>) -> Option<UsageSummary> {
     let state = app.try_state::<AppState>()?;
-    state.repository().summary(&SummaryQuery::default()).ok()
+    state.reader().summary(&SummaryQuery::default()).ok()
 }
 
 /// Every live allowance window, ordered source by source, shortest window
 /// first — the order the menu reads in.
 fn current_quotas<R: Runtime>(app: &AppHandle<R>) -> Vec<UsageQuota> {
-    let Some(state) = app.try_state::<AppState>() else { return Vec::new() };
+    let Some(state) = app.try_state::<AppState>() else {
+        return Vec::new();
+    };
     let mut quotas = state.quotas();
     quotas.sort_by_key(|quota| (quota.source_app, quota.window_minutes));
     quotas
@@ -53,7 +55,9 @@ fn current_quotas<R: Runtime>(app: &AppHandle<R>) -> Vec<UsageQuota> {
 /// Repaint the status item after the store changed underneath it — called
 /// after every import, or the bar would keep showing the startup summary.
 pub fn refresh<R: Runtime>(app: &AppHandle<R>) {
-    let Some(tray) = app.tray_by_id("usage") else { return };
+    let Some(tray) = app.tray_by_id("usage") else {
+        return;
+    };
     let summary = current_summary(app);
     let quotas = current_quotas(app);
     let _ = tray.set_title(Some(&title_for(summary.as_ref(), &quotas)));
@@ -90,14 +94,21 @@ fn title_for(summary: Option<&UsageSummary>, quotas: &[UsageQuota]) -> String {
         ));
     }
 
-    if parts.is_empty() { "—".to_string() } else { parts.join(" · ") }
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join(" · ")
+    }
 }
 
 /// The window with the least left over, once per source, in source order.
 fn tightest_per_source(quotas: &[UsageQuota]) -> Vec<&UsageQuota> {
     let mut tightest: Vec<&UsageQuota> = Vec::new();
     for quota in quotas {
-        match tightest.iter_mut().find(|kept| kept.source_app == quota.source_app) {
+        match tightest
+            .iter_mut()
+            .find(|kept| kept.source_app == quota.source_app)
+        {
             Some(kept) => {
                 if quota.remaining_percent_tenths() < kept.remaining_percent_tenths() {
                     *kept = quota;
@@ -132,17 +143,27 @@ fn build_menu<R: Runtime>(
     let menu = Menu::new(app)?;
 
     for quota in quotas {
-        let resets = quota.resets_at.with_timezone(&chrono::Local).format("%b %-d, %-I:%M%p");
         let meter = quota.label.as_ref().map_or_else(
             || source_tag(quota.source_app).to_string(),
             |label| format!("{} {}", source_tag(quota.source_app), label.to_lowercase()),
         );
+        // A window with no reset has not started, and saying so is clearer than
+        // a blank where every other line carries a time.
+        let when = match quota.resets_at {
+            Some(resets_at) => format!(
+                "resets {}",
+                resets_at
+                    .with_timezone(&chrono::Local)
+                    .format("%b %-d, %-I:%M%p")
+            ),
+            None => "not started".to_string(),
+        };
         let line = format!(
-            "{} · {}% of the {} left · resets {}",
+            "{} · {}% of the {} left · {}",
             meter,
             round_tenths(quota.remaining_percent_tenths()),
             window_label(quota.window_minutes),
-            resets,
+            when,
         );
         let id = format!("quota:{}", quota.source_app.as_str());
         menu.append(&disabled(app, &id, &line)?)?;
@@ -152,7 +173,10 @@ fn build_menu<R: Runtime>(
     }
 
     if let Some(summary) = summary {
-        let tokens = format!("{} tokens", group_digits(summary.totals.display_total.tokens));
+        let tokens = format!(
+            "{} tokens",
+            group_digits(summary.totals.display_total.tokens)
+        );
         menu.append(&disabled(app, "total", &tokens)?)?;
 
         if let Some(cost) = summary.totals.cost.by_currency.first() {
@@ -175,9 +199,21 @@ fn build_menu<R: Runtime>(
         menu.append(&PredefinedMenuItem::separator(app)?)?;
     }
 
-    menu.append(&MenuItem::with_id(app, "open", "Open Tokens", true, None::<&str>)?)?;
+    menu.append(&MenuItem::with_id(
+        app,
+        "open",
+        "Open Tokens",
+        true,
+        None::<&str>,
+    )?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&MenuItem::with_id(app, "quit", "Quit Tokens", true, None::<&str>)?)?;
+    menu.append(&MenuItem::with_id(
+        app,
+        "quit",
+        "Quit Tokens",
+        true,
+        None::<&str>,
+    )?)?;
 
     Ok(menu)
 }
@@ -204,11 +240,7 @@ fn window_label(window_minutes: u32) -> String {
 }
 
 fn show_window<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-    }
+    crate::mini::show_dashboard(app);
 }
 
 /// Menu-bar width is scarce, so large counts are abbreviated. One decimal is
@@ -334,13 +366,17 @@ mod tests {
         assert_eq!(title_for(None, &[]), "—");
     }
 
-    fn quota(source: crate::domain::SourceApp, window_minutes: u32, used_tenths: u16) -> UsageQuota {
+    fn quota(
+        source: crate::domain::SourceApp,
+        window_minutes: u32,
+        used_tenths: u16,
+    ) -> UsageQuota {
         UsageQuota {
             source_app: source,
             label: None,
             window_minutes,
             used_percent_tenths: used_tenths,
-            resets_at: chrono::DateTime::from_timestamp(1_785_264_899, 0).unwrap(),
+            resets_at: Some(chrono::DateTime::from_timestamp(1_785_264_899, 0).unwrap()),
             observed_at: chrono::DateTime::from_timestamp(1_785_200_000, 0).unwrap(),
         }
     }

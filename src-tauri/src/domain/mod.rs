@@ -13,13 +13,12 @@ pub mod quota;
 pub mod record;
 pub mod source;
 pub mod summary;
+pub mod sync;
 pub mod tokens;
 
 pub use draft::{CostDraft, UsageRecordDraft};
 pub use money::{Money, MoneyError};
-pub use notifications::{
-    evaluate_alerts, AlertAction, ThresholdAlert, HANDOFF_PROMPT,
-};
+pub use notifications::{evaluate_alerts, AlertAction, ThresholdAlert, HANDOFF_PROMPT};
 pub use options::{AppOptions, OptionsError, SourceThreshold, ThresholdMetric};
 pub use quality::{CostCalculationStatus, FieldQuality, TimestampInterpretation};
 pub use quota::UsageQuota;
@@ -30,5 +29,8 @@ pub use source::SourceApp;
 pub use summary::{
     CostTotal, CurrencyTotal, GroupSummary, RecentQuery, SummaryQuery, TokenTotal, UsageSummary,
     UsageTotals,
+};
+pub use sync::{
+    RepositoryRevision, ReplaceScope, SourceCheckpoint, SourceSyncHealth, SyncState,
 };
 pub use tokens::{TokenCounts, TokenField};

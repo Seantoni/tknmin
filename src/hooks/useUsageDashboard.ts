@@ -1,45 +1,38 @@
 /**
- * Loads everything the dashboard shows.
+ * Loads everything the dashboard shows, at one revision.
  *
- * All of it comes from Tauri commands, so the interface has no data source
- * other than Rust — including the filtering, which the repository applies.
+ * The interface owns no refresh cadence. There is no timer here, no scan
+ * command, and no polling: Rust's coordinator decides when sources are read,
+ * commits a revision, and says so. This hook's whole job is the subscription
+ * handshake that makes that safe against races:
  *
- * Two summaries are fetched: `overview` always covers every record, so the
- * source breakdown stays stable and comparable while a filter is active, and
- * `summary` reflects the current selection.
+ *   1. subscribe to `data-changed` **before** fetching, so an event emitted
+ *      during the initial load cannot be lost
+ *   2. fetch one snapshot, which names the revision it was read at
+ *   3. ignore every event at or below that revision
+ *   4. fetch again only on a higher one
+ *
+ * Doing it in that order is what closes the gap where a commit lands between
+ * a fetch returning and a listener attaching.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 
 import {
-  fetchRecentUsage,
-  fetchUsageQuota,
-  fetchUsageRecordCount,
-  fetchUsageSources,
-  fetchUsageSummary,
-  refreshLogs,
+  DATA_CHANGED,
+  fetchDashboardSnapshot,
+  fetchSourceCapabilities,
+  syncNow,
   toAppError,
 } from "../api/usage";
 import type {
   AdapterInfo,
   AppError,
+  DashboardSnapshot,
+  DataChanged,
   SourceApp,
-  UsageQuota,
-  UsageRecord,
-  UsageSummary,
 } from "../domain/usage";
-
-export interface DashboardData {
-  /** Unfiltered, for proportions and the total record count. */
-  overview: UsageSummary;
-  /** Reflects the active filter. */
-  summary: UsageSummary;
-  recent: UsageRecord[];
-  sources: AdapterInfo[];
-  recordCount: number;
-  quotas: UsageQuota[];
-}
 
 export type DashboardStatus = "loading" | "ready" | "error";
 
@@ -48,7 +41,10 @@ export const DASHBOARD_WINDOW_DAYS = 30;
 
 export interface Dashboard {
   status: DashboardStatus;
-  data: DashboardData | null;
+  /** The last snapshot that loaded. Stays on screen while a newer one loads. */
+  snapshot: DashboardSnapshot | null;
+  /** Static per-source facts, fetched once. */
+  sources: AdapterInfo[];
   error: AppError | null;
   /** True while a reload runs with earlier data still on screen. */
   isRefreshing: boolean;
@@ -58,12 +54,13 @@ export interface Dashboard {
   toggleSource: (source: SourceApp) => void;
   clearFilter: () => void;
   reload: () => void;
-  /** Rescan the logs on disk, then reload. This is the manual import. */
-  refresh: () => void;
+  /** Recovery only: asks the backend to catch up now. */
+  requestSync: () => void;
 }
 
 export function useUsageDashboard(): Dashboard {
-  const [data, setData] = useState<DashboardData | null>(null);
+  const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
+  const [sources, setSources] = useState<AdapterInfo[]>([]);
   const [error, setError] = useState<AppError | null>(null);
   const [status, setStatus] = useState<DashboardStatus>("loading");
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -74,6 +71,8 @@ export function useUsageDashboard(): Dashboard {
   const requestId = useRef(0);
   const isMounted = useRef(true);
   const hasLoaded = useRef(false);
+  /** The highest revision already on screen, or already being fetched for. */
+  const revision = useRef(-1);
 
   const load = useCallback(async (source: SourceApp | null) => {
     const currentRequest = ++requestId.current;
@@ -92,23 +91,22 @@ export function useUsageDashboard(): Dashboard {
     const filter = source === null ? { from } : { from, sources: [source] };
 
     try {
-      const [overview, summary, recent, sources, recordCount, quotas] = await Promise.all([
-        fetchUsageSummary({ from }),
-        fetchUsageSummary(filter),
-        fetchRecentUsage({ filter }),
-        fetchUsageSources(),
-        fetchUsageRecordCount(),
-        fetchUsageQuota(),
-      ]);
+      const loaded = await fetchDashboardSnapshot({ from }, { filter });
+      // A response for a filter the user has since changed describes the
+      // wrong question, however fresh it is.
       if (!isMounted.current || currentRequest !== requestId.current) return;
-      setData({ overview, summary, recent, sources, recordCount, quotas });
+      revision.current = loaded.revision;
+      setSnapshot(loaded);
       setError(null);
       setStatus("ready");
       hasLoaded.current = true;
     } catch (caught) {
       if (!isMounted.current || currentRequest !== requestId.current) return;
       setError(toAppError(caught));
-      setStatus("error");
+      // A failed fetch with data already on screen keeps that data: those
+      // numbers are last-known-good rather than wrong, and blanking them
+      // would hide more than the message explains.
+      if (!hasLoaded.current) setStatus("error");
     } finally {
       if (isMounted.current && currentRequest === requestId.current) {
         setIsRefreshing(false);
@@ -118,11 +116,66 @@ export function useUsageDashboard(): Dashboard {
 
   useEffect(() => {
     isMounted.current = true;
-    void load(selectedSource);
     return () => {
       isMounted.current = false;
     };
+  }, []);
+
+  const selectedRef = useRef(selectedSource);
+  selectedRef.current = selectedSource;
+
+  // The subscription is attached before the first fetch and torn down after
+  // it, so no committed revision can slip through the gap around either.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+
+    void listen<DataChanged>(DATA_CHANGED, (event) => {
+      if (cancelled) return;
+      // Already covered by what is on screen, or by a fetch in flight.
+      if (event.payload.revision <= revision.current) return;
+      revision.current = event.payload.revision;
+      void load(selectedRef.current);
+    }).then((off) => {
+      if (cancelled) off();
+      else unlisten = off;
+    });
+
+    void load(selectedRef.current);
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [load]);
+
+  // Changing the filter re-reads at whatever revision is current. The
+  // revision guard is deliberately not reset: the data has not changed, only
+  // the question being asked of it.
+  const isFirstRender = useRef(true);
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    void load(selectedSource);
   }, [load, selectedSource]);
+
+  // Static capabilities never change while the app runs, so they are fetched
+  // once rather than travelling in every snapshot.
+  useEffect(() => {
+    let cancelled = false;
+    void fetchSourceCapabilities()
+      .then((loaded) => {
+        if (!cancelled) setSources(loaded);
+      })
+      .catch(() => {
+        // Nothing on this screen depends on it; the footer simply says less.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const toggleSource = useCallback((source: SourceApp) => {
     setSelectedSource((current) => (current === source ? null : source));
@@ -131,65 +184,25 @@ export function useUsageDashboard(): Dashboard {
   const clearFilter = useCallback(() => setSelectedSource(null), []);
 
   const reload = useCallback(() => {
-    void load(selectedSource);
-  }, [load, selectedSource]);
-
-  const refresh = useCallback(() => {
-    void (async () => {
-      setIsRefreshing(true);
-      try {
-        await refreshLogs();
-      } catch {
-        // A failed scan still leaves earlier data on screen; reload below
-        // surfaces a store-level error if there is one.
-      }
-      await load(selectedSource);
-    })();
-  }, [load, selectedSource]);
-
-  // The startup import finishes after the window is already up; when it
-  // lands, pull the freshly imported records onto the screen.
-  const selectedSourceRef = useRef(selectedSource);
-  selectedSourceRef.current = selectedSource;
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    listen("usage-imported", () => {
-      void load(selectedSourceRef.current);
-    }).then((off) => {
-      unlisten = off;
-    });
-    return () => unlisten?.();
+    void load(selectedRef.current);
   }, [load]);
 
-  // Quota checks are cheap and run more frequently than full log imports.
-  // Apply their event payload directly so the remaining allowance stays live
-  // without re-fetching every dashboard aggregation once a minute.
-  useEffect(() => {
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    void listen<UsageQuota[]>("quotas-updated", (event) => {
-      if (!cancelled) {
-        setData((current) => (current === null ? null : { ...current, quotas: event.payload }));
-      }
-    }).then((off) => {
-      if (cancelled) off();
-      else unlisten = off;
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
+  const requestSync = useCallback(() => {
+    // Fire and forget: the answer arrives as a committed revision, not as a
+    // return value.
+    void syncNow().catch(() => {});
   }, []);
 
   return {
     status,
-    data,
+    snapshot,
+    sources,
     error,
     isRefreshing,
     selectedSource,
     toggleSource,
     clearFilter,
     reload,
-    refresh,
+    requestSync,
   };
 }

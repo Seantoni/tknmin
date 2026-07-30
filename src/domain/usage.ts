@@ -80,8 +80,12 @@ export interface UsageRecord {
   timestampInterpretation: TimestampInterpretation;
   sourceApp: SourceApp;
   sourceEventId: string | null;
+  /** Identity: which source event this is. Stable across corrections. */
   dedupeKey: string;
   dedupeAlgorithmVersion: number;
+  /** Content: what this observation of the event said. */
+  contentHash: string;
+  contentHashVersion: number;
   provider: string | null;
   model: string | null;
   tokens: TokenCounts;
@@ -154,34 +158,87 @@ export interface RecentQuery {
   filter: SummaryQuery;
 }
 
-/** A source application and whether this build can read its logs yet. */
+/**
+ * Static facts about a source application.
+ *
+ * Deliberately says nothing about whether the source is currently readable:
+ * that is live state, it changes without the interface asking, and it travels
+ * in the snapshot as {@link SourceSyncHealth}.
+ */
 export interface AdapterInfo {
   id: string;
   version: string;
   sourceApp: SourceApp;
   displayName: string;
-  readsLogs: boolean;
+  /** True when reading this source can require the network. */
+  needsNetwork: boolean;
 }
 
-export type RefreshStatus = "imported" | "planned" | "failed";
+/** What a source's last synchronization attempt did. */
+export type SyncState =
+  | "unknown"
+  | "current"
+  | "syncing"
+  | "stale"
+  | "offline"
+  | "error";
 
-/** What one adapter did during a log refresh. */
-export interface SourceRefreshReport {
-  adapter: string;
-  status: RefreshStatus;
-  sourcesFound: number;
-  sourcesFailed: number;
-  draftsParsed: number;
+/**
+ * One source's freshness, as committed.
+ *
+ * Two clocks, kept apart on purpose. `sourceObservedAt` is when the source
+ * says its data was true; `appSyncedAt` is when this app last read it. A
+ * successful read of a stale file advances the second and not the first.
+ */
+export interface SourceSyncHealth {
+  sourceApp: SourceApp;
+  state: SyncState;
+  appSyncedAt: string | null;
+  sourceObservedAt: string | null;
+  lastAttemptAt: string | null;
+  lastError: string | null;
+  /**
+   * Activity was detected but the provider has not published the billed
+   * numbers for it yet. Cursor does this routinely.
+   */
+  awaitingUpstream: boolean;
+}
+
+/** Which half of a source's data a change touched. */
+export type RefreshCategory = "usage" | "quota";
+
+/**
+ * The one event the backend emits when data changes.
+ *
+ * It always names a revision that is already durable, so refetching on it can
+ * never read a revision that does not exist yet.
+ */
+export interface DataChanged {
+  revision: number;
+  affectedSources: SourceApp[];
+  affectedCategories: RefreshCategory[];
   inserted: number;
-  duplicatesSkipped: number;
-  rejected: number;
-  failures: string[];
+  updated: number;
+  deleted: number;
+  appSyncedAt: string;
 }
 
-/** The outcome of rescanning every source's logs. */
-export interface RefreshReport {
-  sources: SourceRefreshReport[];
+/**
+ * Everything one screen renders, read at a single revision.
+ *
+ * Fetched as a unit precisely so a total from one revision can never appear
+ * beside a quota from another.
+ */
+export interface DashboardSnapshot {
+  revision: number;
+  /** Unfiltered, so proportions stay comparable while a filter is active. */
+  overview: UsageSummary;
+  /** Reflects the active filter. */
+  summary: UsageSummary;
+  recent: UsageRecord[];
+  recordCount: number;
   quotas: UsageQuota[];
+  health: SourceSyncHealth[];
 }
 
 /**
@@ -196,8 +253,11 @@ export interface UsageQuota {
   windowMinutes: number;
   /** Tenths of a percent consumed, so 930 means 93.0%. Integer, like money. */
   usedPercentTenths: number;
-  /** RFC 3339 instant the window resets. */
-  resetsAt: string;
+  /**
+   * RFC 3339 instant the window resets, or null when no window is running — a
+   * rolling window that nothing has started yet, with its allowance untouched.
+   */
+  resetsAt: string | null;
   /** When the source wrote this snapshot. */
   observedAt: string;
 }

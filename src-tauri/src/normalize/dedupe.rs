@@ -1,9 +1,17 @@
-//! Deterministic deduplication keys.
+//! Deterministic identity and content keys.
 //!
-//! Re-importing the same log must not create a second record, so the key is a
-//! pure function of the source event's own content. It deliberately excludes
-//! adapter version and import time: upgrading an adapter must not resurrect
-//! records that were already imported.
+//! Two different questions, two different hashes:
+//!
+//! - [`dedupe_key`] answers *which source event is this*. It is stable across
+//!   re-reads and across corrections, so a later snapshot of the same event
+//!   lands on the row the earlier one created.
+//! - [`content_hash`] answers *has anything meaningful changed*. It covers the
+//!   fields a correction can move — tokens, cost, model, timestamp — so an
+//!   unchanged replay is recognised as a no-op instead of a rewrite.
+//!
+//! Both deliberately exclude adapter version and import time: upgrading an
+//! adapter must not resurrect records that were already imported, nor make
+//! every replay look like a change.
 
 use sha2::{Digest, Sha256};
 
@@ -28,7 +36,12 @@ pub fn dedupe_key(draft: &UsageRecordDraft) -> String {
         draft.source_app.as_str().to_string(),
     ];
 
-    match draft.source_event_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+    match draft
+        .source_event_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
         Some(event_id) => {
             parts.push("event".to_string());
             parts.push(event_id.to_string());
@@ -39,9 +52,19 @@ pub fn dedupe_key(draft: &UsageRecordDraft) -> String {
             parts.push(optional(draft.provider.as_deref()));
             parts.push(optional(draft.model.as_deref()));
             for (_, field) in draft.tokens.fields() {
-                parts.push(field.value.map(|value| value.to_string()).unwrap_or_default());
+                parts.push(
+                    field
+                        .value
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                );
             }
-            parts.push(draft.reported_total_tokens.map(|value| value.to_string()).unwrap_or_default());
+            parts.push(
+                draft
+                    .reported_total_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            );
             parts.push(optional(draft.project.as_deref()));
             parts.push(optional(draft.session_id.as_deref()));
         }
@@ -56,6 +79,57 @@ pub fn dedupe_key(draft: &UsageRecordDraft) -> String {
 /// same source event always resolves to the same identifier across imports.
 pub fn record_id(source: &str, dedupe_key: &str) -> String {
     format!("{source}_{}", &dedupe_key[..16])
+}
+
+/// Bumped whenever the set of fields a correction is allowed to move changes.
+pub const CONTENT_HASH_VERSION: u32 = 1;
+
+/// Digest of every field a later snapshot of the same event may correct.
+///
+/// Identity is excluded on purpose: two drafts with the same
+/// [`dedupe_key`] and the same content hash are the same observation, and
+/// storing the second one again would be pure churn.
+pub fn content_hash(draft: &UsageRecordDraft) -> String {
+    let mut parts: Vec<String> = vec![
+        format!("v{CONTENT_HASH_VERSION}"),
+        optional(draft.raw_timestamp.as_deref()),
+        optional(draft.provider.as_deref()),
+        optional(draft.model.as_deref()),
+    ];
+    for (_, field) in draft.tokens.fields() {
+        parts.push(
+            field
+                .value
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
+        parts.push(format!("{:?}", field.quality));
+    }
+    parts.push(
+        draft
+            .reported_total_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    );
+    parts.push(optional(draft.project.as_deref()));
+    parts.push(optional(draft.session_id.as_deref()));
+    match &draft.cost {
+        Some(cost) => {
+            parts.push(format!("{:?}", cost.status));
+            parts.push(optional(cost.pricing_version.as_deref()));
+            match &cost.amount {
+                Some(money) => parts.push(format!(
+                    "{}/{}/{}",
+                    money.amount_minor, money.currency, money.minor_unit_exponent
+                )),
+                None => parts.push(String::new()),
+            }
+        }
+        None => parts.push(String::new()),
+    }
+
+    let canonical = parts.join(&SEP.to_string());
+    hex::encode(Sha256::digest(canonical.as_bytes()))
 }
 
 fn optional(value: Option<&str>) -> String {

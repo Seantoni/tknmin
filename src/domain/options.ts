@@ -20,6 +20,8 @@ export interface SourceThreshold {
 
 export interface AppOptions {
   thresholds: SourceThreshold[];
+  /** Whether the compact window floats above other applications. */
+  miniAlwaysOnTop: boolean;
 }
 
 export const THRESHOLD_METRICS: readonly ThresholdMetric[] = [
@@ -41,6 +43,7 @@ export function defaultOptions(): AppOptions {
       metric: "remaining_percent",
       value: DEFAULT_THRESHOLD_VALUE.remaining_percent,
     })),
+    miniAlwaysOnTop: true,
   };
 }
 

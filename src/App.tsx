@@ -6,6 +6,7 @@ import { EventList } from "./components/EventList";
 import { ModelBreakdown } from "./components/ModelBreakdown";
 import { SettingsView } from "./components/SettingsView";
 import { DashboardSkeleton, SettingsSkeleton } from "./components/Skeletons";
+import { SourceHealthRow } from "./components/SourceHealth";
 import { SourceStrip } from "./components/SourceStrip";
 import { StatBar } from "./components/StatBar";
 import { DASHBOARD_WINDOW_DAYS, useUsageDashboard } from "./hooks/useUsageDashboard";
@@ -20,15 +21,24 @@ import {
   tightestQuotaPerSource,
 } from "./format";
 import { SOURCE_LABEL } from "./theme";
-import "./App.css";
+import { showMiniWindow } from "./api/window";
 
 type Screen = "dashboard" | "settings";
 
 function App() {
   const [screen, setScreen] = useState<Screen>("dashboard");
-  const [handoffCopiedKey, setHandoffCopiedKey] = useState<string | null>(null);
-  const { status, data, error, isRefreshing, selectedSource, toggleSource, clearFilter, reload, refresh } =
-    useUsageDashboard();
+  const {
+    status,
+    snapshot,
+    sources,
+    error,
+    isRefreshing,
+    selectedSource,
+    toggleSource,
+    clearFilter,
+    reload,
+    requestSync,
+  } = useUsageDashboard();
   const {
     status: optionsStatus,
     options,
@@ -37,7 +47,7 @@ function App() {
     reload: reloadOptions,
     update: updateOptions,
   } = useOptions();
-  const { alerts, continueAlert, createHandoff } = useThresholdAlerts();
+  const { alerts, handoffCopiedKey, continueAlert, createHandoff } = useThresholdAlerts();
 
   const onOptionsChange = (next: AppOptions) => {
     void updateOptions(next);
@@ -49,12 +59,12 @@ function App() {
         <div className="brand">
           <h1>tokens</h1>
           {screen === "dashboard" &&
-            tightestQuotaPerSource(data?.quotas ?? []).map((quota) => (
+            tightestQuotaPerSource(snapshot?.quotas ?? []).map((quota) => (
               <span
                 key={quota.sourceApp}
                 className="quota"
                 title={describeQuotaWindows(
-                  (data?.quotas ?? []).filter((each) => each.sourceApp === quota.sourceApp),
+                  (snapshot?.quotas ?? []).filter((each) => each.sourceApp === quota.sourceApp),
                 )}
               >
                 {SOURCE_LABEL[quota.sourceApp]} ·{" "}
@@ -70,11 +80,19 @@ function App() {
               <button
                 type="button"
                 className="ghost"
-                onClick={refresh}
+                onClick={requestSync}
                 disabled={isRefreshing}
-                title="rescan logs on disk and reload"
+                title="sources update on their own; this only asks the app to catch up now"
               >
-                {isRefreshing ? "…" : "refresh"}
+                {isRefreshing ? "…" : "sync now"}
+              </button>
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => void showMiniWindow()}
+                title="shrink to a small window showing only what is used and left"
+              >
+                minimize
               </button>
             </>
           )}
@@ -90,14 +108,9 @@ function App() {
         <AlertBanner
           alerts={alerts}
           handoffCopiedKey={handoffCopiedKey}
-          onContinue={(key) => {
-            setHandoffCopiedKey(null);
-            void continueAlert(key);
-          }}
+          onContinue={(key) => void continueAlert(key)}
           onCreateHandoff={(key) => {
-            void createHandoff(key).then(() => {
-              setHandoffCopiedKey(key);
-            });
+            void createHandoff(key);
           }}
         />
       )}
@@ -134,15 +147,15 @@ function App() {
             </div>
           )}
 
-          {status === "ready" && data !== null && (
+          {status === "ready" && snapshot !== null && (
             <main>
-              {data.recordCount === 0 ? (
+              {snapshot.recordCount === 0 ? (
                 <p className="empty">No usage recorded yet.</p>
-              ) : data.overview.totals.recordCount === 0 ? (
+              ) : snapshot.overview.totals.recordCount === 0 ? (
                 <p className="empty">No usage in the last {DASHBOARD_WINDOW_DAYS} days.</p>
               ) : (
                 <>
-                  <StatBar totals={data.summary.totals} records={data.recent} />
+                  <StatBar totals={snapshot.summary.totals} records={snapshot.recent} />
 
                   <section className="block">
                     <div className="block-head">
@@ -154,34 +167,33 @@ function App() {
                       )}
                     </div>
                     <SourceStrip
-                      overview={data.overview}
-                      quotas={data.quotas}
+                      overview={snapshot.overview}
+                      quotas={snapshot.quotas}
                       selected={selectedSource}
                       onSelect={toggleSource}
                     />
                   </section>
 
-                  <ModelBreakdown groups={data.summary.byModel} />
+                  <ModelBreakdown groups={snapshot.summary.byModel} />
 
                   <section className="block">
                     <div className="block-head">
                       <span className="label">events</span>
                       <span className="count">
-                        {data.summary.totals.recordCount}
-                        {selectedSource !== null && ` of ${data.overview.totals.recordCount}`}
+                        {snapshot.summary.totals.recordCount}
+                        {selectedSource !== null && ` of ${snapshot.overview.totals.recordCount}`}
                       </span>
                     </div>
-                    <EventList records={data.recent} />
+                    <EventList records={snapshot.recent} />
                   </section>
                 </>
               )}
 
+              <SourceHealthRow health={snapshot.health} sources={sources} />
+
               <footer className="foot">
-                {data.sources
-                  .map((source) => `${source.displayName} ${source.readsLogs ? "· live" : "· soon"}`)
-                  .join("  ")}
-                {data.summary.undatedRecordsExcluded > 0 &&
-                  ` · ${data.summary.undatedRecordsExcluded} undated records excluded`}
+                {snapshot.summary.undatedRecordsExcluded > 0 &&
+                  `${snapshot.summary.undatedRecordsExcluded} undated records excluded`}
               </footer>
             </main>
           )}

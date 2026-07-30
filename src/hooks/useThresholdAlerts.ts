@@ -6,6 +6,7 @@ import type { ThresholdAlert } from "../domain/notifications";
 
 export function useThresholdAlerts() {
   const [alerts, setAlerts] = useState<ThresholdAlert[]>([]);
+  const [handoffCopiedKey, setHandoffCopiedKey] = useState<string | null>(null);
 
   const reload = useCallback(async () => {
     try {
@@ -18,35 +19,40 @@ export function useThresholdAlerts() {
   useEffect(() => {
     void reload();
     let cancelled = false;
-    let unlisten: (() => void) | undefined;
+    const unlisteners: Array<() => void> = [];
 
     void listen<ThresholdAlert[]>("threshold-alerts", (event) => {
       if (!cancelled) setAlerts(event.payload);
     }).then((fn) => {
       if (cancelled) fn();
-      else unlisten = fn;
+      else unlisteners.push(fn);
+    });
+
+    void listen<string | null>("threshold-handoff-copied", (event) => {
+      if (!cancelled && event.payload !== null) setHandoffCopiedKey(event.payload);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisteners.push(fn);
     });
 
     return () => {
       cancelled = true;
-      unlisten?.();
+      unlisteners.forEach((unlisten) => unlisten());
     };
   }, [reload]);
 
   const continueAlert = useCallback(async (dedupeKey: string) => {
     const next = await snoozeAlert(dedupeKey);
+    setHandoffCopiedKey(null);
     setAlerts(next);
   }, []);
 
-  const createHandoff = useCallback(async (_dedupeKey: string) => {
+  const createHandoff = useCallback(async (dedupeKey: string) => {
     const prompt = await fetchHandoffPrompt();
-    try {
-      await navigator.clipboard.writeText(prompt);
-    } catch {
-      // Clipboard can fail without focus; surface the prompt via the banner copy state.
-    }
+    await navigator.clipboard.writeText(prompt);
+    setHandoffCopiedKey(dedupeKey);
     return prompt;
   }, []);
 
-  return { alerts, continueAlert, createHandoff, reload };
+  return { alerts, handoffCopiedKey, continueAlert, createHandoff, reload };
 }

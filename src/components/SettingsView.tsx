@@ -77,7 +77,7 @@ export function SettingsView({
       }
       return next;
     });
-    onChange({ thresholds });
+    onChange({ ...options, thresholds });
   };
 
   const onTestNotification = async () => {
@@ -85,9 +85,9 @@ export function SettingsView({
     setTestMessage(null);
     try {
       await testNotification();
-      setTestMessage("sent — check Notification Center");
+      setTestMessage("delivered — check Notification Center");
     } catch (error) {
-      setTestMessage(messageFromError(error) || "could not send notification");
+      setTestMessage(messageFromError(error) || "could not deliver notification");
     } finally {
       setTestingNotification(false);
     }
@@ -253,6 +253,28 @@ export function SettingsView({
             {cursorMessage !== null && <p className="settings-hint credential-message">{cursorMessage}</p>}
           </>
         )}
+      </section>
+
+      <section className="block">
+        <div className="block-head">
+          <span className="label">compact window</span>
+        </div>
+        <p className="settings-lead">
+          Minimize on the dashboard shrinks Tokens to a small window showing only what each source
+          has used and has left. Keep it floating to read it beside a full-screen editor.
+        </p>
+        <div className="settings-row">
+          <label className="threshold-toggle">
+            <input
+              type="checkbox"
+              checked={options.miniAlwaysOnTop}
+              onChange={(event) =>
+                onChange({ ...options, miniAlwaysOnTop: event.target.checked })
+              }
+            />
+            <span>stay on top of other windows</span>
+          </label>
+        </div>
       </section>
 
       <section className="block">

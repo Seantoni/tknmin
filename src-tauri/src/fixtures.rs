@@ -16,8 +16,8 @@
 use chrono::{DateTime, TimeZone, Utc};
 
 use crate::domain::{
-    CostCalculationStatus, CostDraft, FieldQuality, Money, SourceApp, SourceProvenance, TokenCounts,
-    TokenField, UsageRecord, UsageRecordDraft,
+    CostCalculationStatus, CostDraft, FieldQuality, Money, SourceApp, SourceProvenance,
+    TokenCounts, TokenField, UsageRecord, UsageRecordDraft,
 };
 use crate::normalize;
 
@@ -380,7 +380,9 @@ const ENTRIES: &[Entry] = &[
 ///
 /// Fixed rather than "now" so two launches produce byte-identical records.
 fn fixture_imported_at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).single().expect("fixture import time is valid")
+    Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0)
+        .single()
+        .expect("fixture import time is valid")
 }
 
 fn provenance() -> SourceProvenance {
@@ -393,7 +395,10 @@ fn provenance() -> SourceProvenance {
 
 fn token_field(value: Option<u64>, quality: FieldQuality) -> TokenField {
     match value {
-        Some(value) => TokenField { value: Some(value), quality },
+        Some(value) => TokenField {
+            value: Some(value),
+            quality,
+        },
         None => TokenField::unknown(),
     }
 }
@@ -450,7 +455,23 @@ pub fn fake_records() -> Vec<UsageRecord> {
 mod tests {
     use super::*;
     use crate::domain::{RecentQuery, SummaryQuery, TimestampInterpretation, TotalRule};
-    use crate::repository::{InMemoryUsageRepository, UsageRepository};
+    use crate::repository::{
+        InMemoryUsageRepository, SourceTransaction, UsageReader, UsageWriter,
+    };
+
+    fn seed(repository: &InMemoryUsageRepository) -> crate::repository::CommitCounts {
+        repository
+            .commit(SourceTransaction {
+                records: fake_records(),
+                ..SourceTransaction::new(
+                    crate::domain::SourceApp::Cursor,
+                    "fixture",
+                    chrono::Utc::now(),
+                )
+            })
+            .unwrap()
+            .counts
+    }
 
     #[test]
     fn every_fixture_normalizes() {
@@ -467,14 +488,16 @@ mod tests {
     #[test]
     fn event_ids_are_unique_so_nothing_deduplicates_away() {
         let repository = InMemoryUsageRepository::new();
-        let first = repository.insert_batch(fake_records()).unwrap();
+        let first = seed(&repository);
         assert_eq!(first.inserted, ENTRIES.len());
-        assert_eq!(first.duplicates_skipped, 0);
+        assert_eq!(first.unchanged, 0);
 
-        // Seeding twice must not double the dashboard's totals.
-        let second = repository.insert_batch(fake_records()).unwrap();
+        // Seeding twice must not double the dashboard's totals, and the
+        // identical content must be recognised as unchanged rather than
+        // rewritten.
+        let second = seed(&repository);
         assert_eq!(second.inserted, 0);
-        assert_eq!(second.duplicates_skipped, ENTRIES.len());
+        assert_eq!(second.unchanged, ENTRIES.len());
     }
 
     #[test]
@@ -499,13 +522,22 @@ mod tests {
         let summary = repository.summary(&SummaryQuery::default()).unwrap();
 
         let expected: i64 = ENTRIES.iter().filter_map(|entry| entry.cost_micros).sum();
-        let priced = ENTRIES.iter().filter(|entry| entry.cost_micros.is_some()).count();
+        let priced = ENTRIES
+            .iter()
+            .filter(|entry| entry.cost_micros.is_some())
+            .count();
 
         assert_eq!(summary.totals.cost.by_currency.len(), 1);
         let usd = &summary.totals.cost.by_currency[0];
-        assert_eq!(usd.amount, Money::new(expected, CURRENCY, COST_EXPONENT).unwrap());
+        assert_eq!(
+            usd.amount,
+            Money::new(expected, CURRENCY, COST_EXPONENT).unwrap()
+        );
         assert_eq!(usd.counted_records, priced);
-        assert_eq!(summary.totals.cost.records_without_cost, ENTRIES.len() - priced);
+        assert_eq!(
+            summary.totals.cost.records_without_cost,
+            ENTRIES.len() - priced
+        );
     }
 
     #[test]
