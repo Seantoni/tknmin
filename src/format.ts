@@ -19,7 +19,7 @@ import type {
   UsageQuota,
   UsageRecord,
 } from "./domain/usage";
-import type { WindowPace } from "./domain/pace";
+import type { QuotaProjection, WindowPace } from "./domain/pace";
 
 /** Shown wherever a source reported nothing. */
 export const UNKNOWN = "—";
@@ -168,6 +168,36 @@ export function formatPercentTenths(tenths: number): string {
 /** Tenths of a percent of the window still unused, never below zero. */
 export function quotaRemainingTenths(quota: UsageQuota): number {
   return Math.max(0, 1000 - quota.usedPercentTenths);
+}
+
+/**
+ * Where this window's usage would sit right now if it were spent evenly — the
+ * "should be" line, as a percent used.
+ *
+ * Even pace is the rate that lands on 100% exactly as the window resets, so a
+ * fill short of this mark has room and a fill past it is borrowing from later.
+ * It is the same assumption the pace domain's window-open measurement makes:
+ * that the window opened `windowMinutes` before it resets. For a rolling
+ * window that is an approximation, and one that errs toward caution, since a
+ * rolling allowance also returns as it ages.
+ *
+ * `null` before there is anything to compare against — a window with no reset
+ * has not started, and one that has only just opened has no elapsed share yet.
+ */
+export function quotaEvenPacePercent(quota: UsageQuota, now: Date = new Date()): number | null {
+  if (quota.windowMinutes <= 0) return null;
+  const remaining = minutesUntil(quota.resetsAt, now);
+  if (remaining === null) return null;
+  const elapsed = quota.windowMinutes - remaining;
+  if (elapsed <= 0) return null;
+  return Math.min(100, (elapsed / quota.windowMinutes) * 100);
+}
+
+/** The same mark in words, for the row's tooltip. */
+export function describeEvenPace(quota: UsageQuota, now: Date = new Date()): string | null {
+  const target = quotaEvenPacePercent(quota, now);
+  if (target === null) return null;
+  return `even pace would be ${formatPercent(target)} used by now`;
 }
 
 /** The quota window the way the user thinks of it: "this week", "today". */
@@ -498,6 +528,142 @@ export function describePaceState(pace: WindowPace, now: Date = new Date()): str
     case "unknown":
       return "too early to say";
   }
+}
+
+/**
+ * The pace verdict in the fewest words that can still be acted on.
+ *
+ * The compact window is a few hundred pixels wide, so a sentence there wraps
+ * to three ragged lines and stops being scannable. What survives the cut is
+ * the one fact that changes behaviour: for a window heading for trouble, when
+ * it runs dry — an absolute duration the eye can compare against the reset
+ * time sitting next to it. Everything else is reassurance, and reassurance
+ * only needs two words.
+ *
+ * `null` where the row's reset time already says it, so the two never repeat
+ * each other.
+ */
+export function describePaceCompact(pace: WindowPace): string | null {
+  switch (pace.state) {
+    case "red":
+      return `out in ${formatRunway(pace.runwayMinutes)}`;
+    case "amber":
+      return "at the edge";
+    case "green":
+      return pace.runwayMinutes === null ? "idle" : "on track";
+    case "exhausted":
+      return "used up";
+    // "not started" is already what the reset slot reads, and "too early to
+    // say" is noise next to a percentage that is plainly untouched.
+    case "notStarted":
+    case "unknown":
+      return null;
+  }
+}
+
+/**
+ * What the verdict is measured against, so "out in 19d" is not left hanging.
+ *
+ * A duration alone cannot be judged: 19 days sounds generous until you know
+ * the window has 24 to go. This supplies the missing half of the comparison —
+ * how far short of the reset the allowance lands — which is the number that
+ * says whether to change anything.
+ *
+ * `null` where there is no gap worth naming, so a healthy row stays quiet.
+ */
+export function describePaceGap(pace: WindowPace): string | null {
+  if (pace.state === "red" && pace.shortfallMinutes !== null) {
+    return `${formatRunway(pace.shortfallMinutes)} short`;
+  }
+  return null;
+}
+
+/**
+ * The pace row matching one quota window, when one was computed. The join is
+ * on all three parts of the window's identity, because a source can meter
+ * several pools at once and they are not interchangeable.
+ */
+export function paceForQuota(paces: WindowPace[], quota: UsageQuota): WindowPace | undefined {
+  return paces.find(
+    (each) =>
+      each.sourceApp === quota.sourceApp &&
+      each.windowMinutes === quota.windowMinutes &&
+      each.label === quota.label,
+  );
+}
+
+/**
+ * The projection for one row, when the backend earned one. Undefined is the
+ * ordinary case, not a failure: it means the confirmed reading is the best
+ * available statement and should be shown exactly as reported.
+ */
+export function projectionForQuota(
+  projections: QuotaProjection[],
+  quota: UsageQuota,
+): QuotaProjection | undefined {
+  return projections.find(
+    (each) =>
+      each.sourceApp === quota.sourceApp &&
+      each.windowMinutes === quota.windowMinutes &&
+      each.label === quota.label,
+  );
+}
+
+/**
+ * Tenths of the window consumed as currently believed — the projection when
+ * there is one, the confirmed reading otherwise.
+ *
+ * This is what the headline and the bar are drawn from, because the question a
+ * row answers is "how much is left *now*", and a reading published ten minutes
+ * ago answers a different one. Provenance is not lost: the caller marks a
+ * projected row, and [`describeProjection`] spells the split out.
+ */
+export function quotaUsedTenths(
+  quota: UsageQuota,
+  projection: QuotaProjection | undefined,
+): number {
+  return projection?.projectedPercentTenths ?? quota.usedPercentTenths;
+}
+
+/** Tenths still unused as currently believed, never below zero. */
+export function quotaLiveRemainingTenths(
+  quota: UsageQuota,
+  projection: QuotaProjection | undefined,
+): number {
+  return Math.max(0, 1000 - quotaUsedTenths(quota, projection));
+}
+
+/**
+ * Where a projected number came from, for the tooltip — the measured part, its
+ * age, the derived increment, and how well the rate behind it is established.
+ * A user who wants to know whether to believe the "≈" gets the whole basis.
+ */
+export function describeProjection(
+  projection: QuotaProjection,
+  now: Date = new Date(),
+): string {
+  return [
+    `${formatPercentTenths(projection.confirmedPercentTenths)} confirmed ${formatAge(
+      projection.confirmedAt,
+      now,
+    )}`,
+    `+${formatPercentTenths(projection.addedPercentTenths)} estimated from usage since`,
+    `rate fitted from ${projection.pairs} readings, spread ±${projection.residualPercent}%`,
+  ].join("\n");
+}
+
+/**
+ * The whole pace story, for a tooltip: the verdict as a sentence, then the
+ * caveats that qualify it. These are what the compact row deliberately leaves
+ * out, so the detail stays one hover away rather than gone.
+ */
+export function describePaceDetail(pace: WindowPace, now: Date = new Date()): string {
+  const lines = [describePaceState(pace, now)];
+  const baseline = describeVsBaseline(pace);
+  if (baseline !== null) lines.push(baseline);
+  const basis = describePaceBasis(pace);
+  if (basis !== null) lines.push(basis);
+  return lines.join("\n");
 }
 
 /**

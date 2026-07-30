@@ -305,7 +305,10 @@ mod tests {
             ledger.snoozed_keys().contains(&key),
             "a snooze was discarded while its window was still running"
         );
-        assert!(ledger.has_fired(&key), "the alert would notify a second time");
+        assert!(
+            ledger.has_fired(&key),
+            "the alert would notify a second time"
+        );
     }
 
     #[test]

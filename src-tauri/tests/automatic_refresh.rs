@@ -133,7 +133,10 @@ fn startup_catches_up_without_anyone_asking() {
 
     refresh.submit(RefreshTrigger::Startup);
 
-    assert!(until(Duration::from_secs(5), || repository.count().unwrap() == 1));
+    assert!(until(Duration::from_secs(5), || repository
+        .count()
+        .unwrap()
+        == 1));
     // Every event names a revision the store already holds, so a listener
     // that refetches on one cannot read something that does not exist yet.
     let events = published.events.lock().unwrap();
@@ -220,7 +223,10 @@ fn a_failing_source_keeps_its_last_good_values_and_says_it_failed() {
     .start();
 
     refresh.submit(RefreshTrigger::Startup);
-    assert!(until(Duration::from_secs(5), || repository.count().unwrap() == 1));
+    assert!(until(Duration::from_secs(5), || repository
+        .count()
+        .unwrap()
+        == 1));
 
     // Now the source breaks.
     *answer.lock().unwrap() = Err(AdapterError::Offline {
@@ -243,7 +249,7 @@ fn a_failing_source_keeps_its_last_good_values_and_says_it_failed() {
     assert_eq!(quotas[0].used_percent_tenths, 420);
     let health = repository.health().unwrap();
     assert!(health[0].app_synced_at.is_some());
-    assert_eq!(health[0].last_error.as_deref().is_some(), true);
+    assert!(health[0].last_error.is_some());
 }
 
 #[test]
@@ -301,7 +307,10 @@ fn a_correction_converges_instead_of_double_counting() {
     .start();
 
     refresh.submit(RefreshTrigger::Startup);
-    assert!(until(Duration::from_secs(5), || repository.count().unwrap() == 1));
+    assert!(until(Duration::from_secs(5), || repository
+        .count()
+        .unwrap()
+        == 1));
 
     // The source restates the same event with a different number.
     *answer.lock().unwrap() = Ok(SourceDelta {
@@ -319,7 +328,11 @@ fn a_correction_converges_instead_of_double_counting() {
             .tokens
             == 999
     }));
-    assert_eq!(repository.count().unwrap(), 1, "the correction was double counted");
+    assert_eq!(
+        repository.count().unwrap(),
+        1,
+        "the correction was double counted"
+    );
 }
 
 #[test]
@@ -352,7 +365,11 @@ fn revisions_only_move_forward() {
     }
 
     let events = published.events.lock().unwrap();
-    assert!(events.len() >= 2, "expected several commits, saw {}", events.len());
+    assert!(
+        events.len() >= 2,
+        "expected several commits, saw {}",
+        events.len()
+    );
     for pair in events.windows(2) {
         assert!(
             pair[1].revision > pair[0].revision,

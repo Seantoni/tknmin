@@ -963,7 +963,22 @@ button.strip-row:hover {
   color: var(--muted);
 }
 
-.mini-list {
+.quota-pace {
+  color: var(--muted);
+}
+
+.quota.is-red .quota-pace {
+  color: var(--text);
+}
+
+/* Allowance rows
+ *
+ * Shared by the compact window and the dashboard's allowances block, so the
+ * two cannot drift apart. Sizes here are the compact window's; the dashboard
+ * scales them up through `.allowances` below without touching the structure.
+ */
+
+.q-list {
   margin: 0;
   padding: 0;
   list-style: none;
@@ -972,23 +987,24 @@ button.strip-row:hover {
   gap: 10px;
 }
 
-.mini-group {
+.q-group {
   display: flex;
   flex-direction: column;
   gap: 5px;
 }
 
-.mini-source {
+.q-source {
   display: flex;
   align-items: center;
   gap: 6px;
+  margin: 0;
   font-size: 12px;
   color: var(--text);
 }
 
 /* Said only when it is true: the source has been used since the last number
  * its provider published, so the percentage above is real but incomplete. */
-.mini-note {
+.q-note {
   margin: 0;
   font-size: 9px;
   color: var(--faint);
@@ -996,7 +1012,7 @@ button.strip-row:hover {
 
 /* The rail is what says "these belong to the source above" — a hairline rather
  * than a box, and uncolored, because color in this interface means data. */
-.mini-pools {
+.q-pools {
   margin: 0 0 0 2px;
   padding: 1px 0 1px 9px;
   border-left: 1px solid var(--line);
@@ -1006,91 +1022,181 @@ button.strip-row:hover {
   gap: 8px;
 }
 
-.mini-row {
+.q-row {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
   cursor: help;
 }
 
-.mini-line {
+/* Every row is exactly two lines around one bar, whatever the sources report.
+ * Nothing here may wrap: a phrase that grows to a second line changes the
+ * row's height, and rows of different heights are what made this panel hard
+ * to read at a glance. Anything too long ellipsizes instead. */
+.q-line {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+  white-space: nowrap;
 }
 
-.mini-name {
+.q-name {
+  min-width: 0;
+  flex: 0 1 auto;
   font-size: 12px;
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
-.mini-window {
+.q-window {
+  flex: 0 0 auto;
   font-size: 10px;
   color: var(--faint);
   letter-spacing: 0.02em;
-  white-space: nowrap;
 }
 
-.mini-left {
+.q-left {
   margin-left: auto;
+  flex: 0 0 auto;
   font-size: 12px;
   color: var(--text);
 }
 
-.mini-detail {
-  font-size: 10px;
-  color: var(--dim);
-}
-
-.mini-used {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.mini-reset {
-  margin-left: auto;
-  font-size: 10px;
-  color: var(--faint);
-  white-space: nowrap;
-}
-
-.mini-pace {
-  font-size: 10px;
-  color: var(--dim);
-}
-
-/* Words carry the state; colour is only redundancy. Red gets the text colour
-   so it reads as a statement, amber stays dim, and every other state keeps
-   the quiet register the rest of the panel uses. */
-.mini-pace.is-red,
-.quota.is-red .quota-pace {
-  color: var(--text);
-}
-
-.mini-pace-basis {
-  color: var(--faint);
-}
-
-.quota-pace {
-  color: var(--muted);
-}
-
-.mini-bar {
+/* Unclipped on purpose: the even-pace tick stands slightly clear of the bar on
+   both sides to be legible at this height. The fills cap their own width and
+   round their own corners, so nothing else needs the bounds enforced. */
+.q-bar {
   display: block;
+  position: relative;
   height: 2px;
   background: var(--line);
   border-radius: 1px;
-  overflow: hidden;
 }
 
-.mini-bar-fill {
+/* Stacked rather than flowed, so the confirmed fill paints over the projected
+   one and only the inferred remainder shows past its end. */
+.q-bar-fill {
   display: block;
-  height: 100%;
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
   border-radius: 1px;
+}
+
+/* The estimated extension: same colour, plainly weaker. It reads as "this far,
+   probably" without needing a legend to say so. */
+.q-bar-fill.is-projected {
+  opacity: 0.4;
+}
+
+/* Where even spending would have reached by now. Grey rather than coloured
+   because it is the reference the fill is judged against, not another
+   measurement: fill short of the tick means room to spare, fill past it means
+   the allowance is being borrowed from later in the window. */
+.q-bar-target {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 1px;
+  /* Drawn on whole pixels, so a 1px tick on a 2px bar stays crisp. */
+  margin-left: -1px;
+  background: var(--dim);
+}
+
+/* Marks a figure the source has not confirmed. Dim and tight against the
+   number so it qualifies it rather than competing with it. */
+.q-approx {
+  margin-right: 1px;
+  color: var(--dim);
+}
+
+.q-detail {
+  font-size: 10px;
+  color: var(--dim);
+}
+
+/* The verdict and the gap it is measured against are the only things on this
+   line that may be squeezed; the reset time is a fixed width and reads as one
+   unit, so truncating it would leave a half-written date. */
+.q-verdict {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Words carry the state; colour is only redundancy. A window heading for
+   trouble gets an accent so its one line reads as a statement, and everything
+   else stays in the quiet register around it. */
+.q-verdict.is-red {
+  color: var(--danger);
+}
+
+.q-verdict.is-amber,
+.q-verdict.is-exhausted {
+  color: var(--muted);
+}
+
+/* How far short of the reset the allowance lands — the reference the duration
+   beside it would otherwise lack. Dim, because it qualifies rather than states. */
+.q-gap {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--faint);
+}
+
+.q-reset {
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--faint);
+}
+
+/* The dashboard has room the panel does not: the same rows, further apart and
+   a step larger, so they read as the same object seen closer up. */
+.allowances .q-list {
+  gap: 15px;
+}
+
+.allowances .q-group {
+  gap: 7px;
+}
+
+.allowances .q-pools {
+  gap: 11px;
+  padding-left: 12px;
+}
+
+.allowances .q-row {
+  gap: 5px;
+}
+
+.allowances .q-source,
+.allowances .q-name,
+.allowances .q-left {
+  font-size: 13px;
+}
+
+.allowances .q-window {
+  font-size: 11px;
+}
+
+.allowances .q-detail,
+.allowances .q-reset {
+  font-size: 11px;
+}
+
+.allowances .q-note {
+  font-size: 10px;
+}
+
+.allowances .q-bar {
+  height: 3px;
 }
 
 .mini-empty {

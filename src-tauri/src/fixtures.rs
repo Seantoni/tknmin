@@ -455,9 +455,7 @@ pub fn fake_records() -> Vec<UsageRecord> {
 mod tests {
     use super::*;
     use crate::domain::{RecentQuery, SummaryQuery, TimestampInterpretation, TotalRule};
-    use crate::repository::{
-        InMemoryUsageRepository, SourceTransaction, UsageReader, UsageWriter,
-    };
+    use crate::repository::{InMemoryUsageRepository, SourceTransaction, UsageReader, UsageWriter};
 
     fn seed(repository: &InMemoryUsageRepository) -> crate::repository::CommitCounts {
         repository

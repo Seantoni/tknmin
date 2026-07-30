@@ -4,6 +4,7 @@ import { AlertBanner } from "./components/AlertBanner";
 import { AppMenu } from "./components/AppMenu";
 import { EventList } from "./components/EventList";
 import { ModelBreakdown } from "./components/ModelBreakdown";
+import { QuotaRows } from "./components/QuotaRows";
 import { SettingsView } from "./components/SettingsView";
 import { DashboardSkeleton, SettingsSkeleton } from "./components/Skeletons";
 import { SourceHealthRow } from "./components/SourceHealth";
@@ -14,10 +15,12 @@ import { useOptions } from "./hooks/useOptions";
 import { useThresholdAlerts } from "./hooks/useThresholdAlerts";
 import type { AppOptions } from "./domain/options";
 import {
-  describePaceState,
+  describePaceCompact,
+  describePaceGap,
   describeQuotaWindow,
   describeQuotaWindows,
   formatPercentTenths,
+  paceForQuota,
   quotaRemainingTenths,
 } from "./format";
 import { SOURCE_LABEL } from "./theme";
@@ -25,16 +28,6 @@ import { showMiniWindow } from "./api/window";
 import { useNow } from "./hooks/useNow";
 import type { WindowPace } from "./domain/pace";
 import type { SourceApp, UsageQuota } from "./domain/usage";
-
-/** The pace row matching one quota window, when one was computed. */
-function paceFor(paces: WindowPace[], quota: UsageQuota): WindowPace | undefined {
-  return paces.find(
-    (each) =>
-      each.sourceApp === quota.sourceApp &&
-      each.windowMinutes === quota.windowMinutes &&
-      each.label === quota.label,
-  );
-}
 
 function pacePriority(pace: WindowPace | undefined): number {
   if (pace === undefined) return 6;
@@ -69,8 +62,8 @@ function headerQuotaPerSource(quotas: UsageQuota[], paces: WindowPace[]): UsageQ
       continue;
     }
 
-    const candidatePace = paceFor(paces, candidate);
-    const heldPace = paceFor(paces, held);
+    const candidatePace = paceForQuota(paces, candidate);
+    const heldPace = paceForQuota(paces, held);
     const candidatePriority = pacePriority(candidatePace);
     const heldPriority = pacePriority(heldPace);
     const candidateRunway = candidatePace?.runwayMinutes ?? Number.MAX_SAFE_INTEGER;
@@ -127,7 +120,9 @@ function App() {
           <h1>tokens</h1>
           {screen === "dashboard" &&
             headerQuotaPerSource(snapshot?.quotas ?? [], snapshot?.pace ?? []).map((quota) => {
-              const pace = paceFor(snapshot?.pace ?? [], quota);
+              const pace = paceForQuota(snapshot?.pace ?? [], quota);
+              const verdict = pace === undefined ? null : describePaceCompact(pace);
+              const gap = pace === undefined ? null : describePaceGap(pace);
               return (
                 <span
                   key={quota.sourceApp}
@@ -139,9 +134,13 @@ function App() {
                   {SOURCE_LABEL[quota.sourceApp]} ·{" "}
                   {formatPercentTenths(quotaRemainingTenths(quota))} left{" "}
                   {describeQuotaWindow(quota.windowMinutes)}
-                  {pace !== undefined &&
-                    (pace.state === "red" || pace.state === "amber") && (
-                      <span className="quota-pace"> · {describePaceState(pace, now)}</span>
+                  {verdict !== null &&
+                    (pace?.state === "red" || pace?.state === "amber") && (
+                      <span className="quota-pace">
+                        {" "}
+                        · {verdict}
+                        {gap !== null && ` · ${gap}`}
+                      </span>
                     )}
                 </span>
               );
@@ -230,6 +229,24 @@ function App() {
               ) : (
                 <>
                   <StatBar totals={snapshot.summary.totals} records={snapshot.recent} />
+
+                  {snapshot.quotas.length > 0 && (
+                    // Above the token breakdowns on purpose: those say what has
+                    // been spent, this says whether there is enough left to keep
+                    // working, which is the question a person opens this for.
+                    <section className="block allowances">
+                      <div className="block-head">
+                        <span className="label">allowances</span>
+                      </div>
+                      <QuotaRows
+                        quotas={snapshot.quotas}
+                        pace={snapshot.pace}
+                        projections={snapshot.projections}
+                        health={snapshot.health}
+                        now={now}
+                      />
+                    </section>
+                  )}
 
                   <section className="block">
                     <div className="block-head">

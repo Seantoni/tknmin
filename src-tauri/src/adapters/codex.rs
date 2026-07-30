@@ -118,10 +118,7 @@ impl SourceAdapter for CodexAdapter {
     /// Both trees, because a rollout is written under `sessions/` and moved
     /// under `archived_sessions/` when the session ends.
     fn watch_roots(&self) -> Vec<PathBuf> {
-        vec![
-            self.root.join(SESSIONS_DIR),
-            self.root.join(ARCHIVED_DIR),
-        ]
+        vec![self.root.join(SESSIONS_DIR), self.root.join(ARCHIVED_DIR)]
     }
 
     fn read_delta(&self, request: &DeltaRequest) -> Result<SourceDelta, AdapterError> {
@@ -292,7 +289,10 @@ impl CodexAdapter {
     /// fixture path; the running application parses chunks instead.
     pub fn parse(&self, input: &RawSourceInput) -> Result<Vec<UsageRecordDraft>, AdapterError> {
         let mut cursor = RolloutCheckpoint::default();
-        let source_ref = input.source_ref.clone().unwrap_or_else(|| "unknown".to_string());
+        let source_ref = input
+            .source_ref
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         Ok(parse_chunk(self, &source_ref, &input.content, &mut cursor).drafts)
     }
 
@@ -404,7 +404,10 @@ fn parse_chunk(
                     continue;
                 };
 
-                let rollout_id = cursor.rollout_id.clone().unwrap_or_else(|| source_ref.to_string());
+                let rollout_id = cursor
+                    .rollout_id
+                    .clone()
+                    .unwrap_or_else(|| source_ref.to_string());
                 let ordinal = cursor.next_ordinal;
                 cursor.next_ordinal += 1;
 
@@ -896,7 +899,10 @@ mod tests {
         // produced a second time.
         assert!(tail(&adapter, &mut carried).drafts.is_empty());
 
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         use std::io::Write;
         writeln!(file, "{}", lines[split..].join("\n")).unwrap();
         drop(file);
@@ -956,11 +962,7 @@ mod tests {
         // a brand new file; keyed by inode it is the same rollout, already read.
         let archived = root.join(ARCHIVED_DIR);
         fs::create_dir_all(&archived).unwrap();
-        fs::rename(
-            &path,
-            archived.join(path.file_name().unwrap()),
-        )
-        .unwrap();
+        fs::rename(&path, archived.join(path.file_name().unwrap())).unwrap();
 
         assert!(tail(&adapter, &mut carried).drafts.is_empty());
 
@@ -1049,7 +1051,10 @@ mod tests {
 
         // A later event moves it, and the newer observation is the one kept.
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(file, "{}", token_count_line("2026-07-28T20:00:00Z", 55.5)).unwrap();
         drop(file);
 

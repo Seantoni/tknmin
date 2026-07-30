@@ -1,55 +1,27 @@
 /**
- * The compact window: what each source has used, what is left, and when it
- * comes back — and nothing else, because at this size anything more would push
- * that answer off the screen. The dashboard is one click away for the rest.
+ * The compact window: what each source has used, what is left, and whether the
+ * current pace reaches the reset — and nothing else, because at this size
+ * anything more would push that answer off the screen. The dashboard is one
+ * click away for the rest.
  *
- * Every allowance window gets a line, not just the one that binds first: a
- * 5-hour session and the week that contains it run down at different rates, and
- * Cursor's own models cannot spend what its other models have left. A source
- * with more than one window keeps them under its own name, so two lines about
- * Cursor read as Cursor's two pools rather than as two separate tools. A source
- * with a single window needs no such heading and gets one line.
+ * The rows themselves are [`QuotaRows`], shared with the dashboard so the two
+ * cannot drift apart. What belongs to this file is the panel: its chrome, its
+ * drag region, and its height.
  *
- * How many lines that adds up to depends on what the sources report — and they
- * differ by plan — so the window is sized from the rendered content rather than
- * guessed at.
+ * How many rows that adds up to depends on what the sources report — and they
+ * differ by plan — so the window is sized from the rendered content rather
+ * than guessed at.
  */
 
 import { useEffect, useRef } from "react";
 
 import { fitMiniWindowHeight, showDashboardWindow } from "../api/window";
-import {
-  describePaceBasis,
-  describePaceState,
-  describeVsBaseline,
-  describeQuotaResetCompact,
-  describeSourceFreshness,
-  describeQuotaWindows,
-  formatPercentTenths,
-  quotaGroups,
-  quotaRemainingTenths,
-  quotaRowKey,
-  quotaWindowTag,
-} from "../format";
+import { QuotaRows } from "./QuotaRows";
 import { useQuotas } from "../hooks/useQuotas";
 import { useNow } from "../hooks/useNow";
-import { SOURCE_COLOR, SOURCE_LABEL } from "../theme";
-import type { SourceApp, UsageQuota } from "../domain/usage";
-import type { WindowPace } from "../domain/pace";
-
-/** The pace row matching one quota window, when one was computed. */
-function paceFor(paces: WindowPace[], quota: UsageQuota): WindowPace | undefined {
-  return paces.find(
-    (each) =>
-      each.sourceApp === quota.sourceApp &&
-      each.windowMinutes === quota.windowMinutes &&
-      each.label === quota.label,
-  );
-}
 
 export function MiniView() {
-  const { status, quotas, pace, health, error } = useQuotas();
-  const groups = quotaGroups(quotas);
+  const { status, quotas, pace, projections, health, error } = useQuotas();
   const panel = useRef<HTMLDivElement>(null);
   const now = useNow();
 
@@ -87,142 +59,19 @@ export function MiniView() {
 
       {status === "error" && error !== null ? (
         <p className="mini-empty">{error.message}</p>
-      ) : groups.length === 0 ? (
+      ) : quotas.length === 0 ? (
         <p className="mini-empty">
           {status === "loading" ? "reading allowances…" : "no source reports an allowance yet"}
         </p>
       ) : (
-        <ul className="mini-list">
-          {groups.map(({ sourceApp, windows }) => {
-            // One line of freshness per source, because at this size a
-            // percentage with no age is indistinguishable from a percentage
-            // that stopped updating an hour ago.
-            const sourceHealth = health.find((each) => each.sourceApp === sourceApp);
-            return (
-            <li
-              key={sourceApp}
-              className="mini-group"
-              title={sourceHealth === undefined ? undefined : describeSourceFreshness(sourceHealth)}
-            >
-              {windows.length === 1 ? (
-                <Window
-                  quota={windows[0]}
-                  quotas={quotas}
-                  pace={paceFor(pace, windows[0])}
-                  now={now}
-                  name={SOURCE_LABEL[sourceApp]}
-                  withDot
-                />
-              ) : (
-                <>
-                  <p className="mini-source">
-                    <span className="dot" style={{ background: SOURCE_COLOR[sourceApp] }} />
-                    {SOURCE_LABEL[sourceApp]}
-                  </p>
-                  <ul className="mini-pools">
-                    {windows.map((quota) => (
-                      <li key={quotaRowKey(quota)}>
-                        <Window
-                          quota={quota}
-                          quotas={quotas}
-                          pace={paceFor(pace, quota)}
-                          now={now}
-                          name={poolName(quota, sourceApp)}
-                        />
-                      </li>
-                    ))}
-                  </ul>
-                </>
-              )}
-              {sourceHealth?.awaitingUpstream === true && (
-                // Cursor detects the activity long before it publishes what it
-                // cost. Saying so beats implying the allowance is untouched.
-                <p className="mini-note">activity detected · awaiting billing data</p>
-              )}
-            </li>
-          );
-          })}
-        </ul>
-      )}
-    </div>
-  );
-}
-
-/**
- * One allowance window: what it is called, how much is left, how much is gone,
- * and when it resets. The tooltip carries every window of the same source, so
- * one row can answer a question about its neighbours.
- *
- * The dot marks a source, so a row standing in for a whole source carries one
- * and a pool nested under a heading does not — its heading already did.
- */
-function Window({
-  quota,
-  quotas,
-  pace,
-  now,
-  name,
-  withDot = false,
-}: {
-  quota: UsageQuota;
-  quotas: UsageQuota[];
-  pace: WindowPace | undefined;
-  now: Date;
-  name: string;
-  withDot?: boolean;
-}) {
-  const tag = quotaWindowTag(quota.windowMinutes);
-  const basis = pace !== undefined ? describePaceBasis(pace) : null;
-  const vsBaseline = pace !== undefined ? describeVsBaseline(pace) : null;
-  return (
-    <div
-      className="mini-row"
-      title={describeQuotaWindows(quotas.filter((each) => each.sourceApp === quota.sourceApp))}
-    >
-      <span className="mini-line">
-        {withDot && <span className="dot" style={{ background: SOURCE_COLOR[quota.sourceApp] }} />}
-        <span className="mini-name">{name}</span>
-        {name !== tag && <span className="mini-window">{tag}</span>}
-        <span className="num mini-left">
-          {formatPercentTenths(quotaRemainingTenths(quota))} left
-        </span>
-      </span>
-      <span className="mini-line mini-detail">
-        <span className="mini-used">{formatPercentTenths(quota.usedPercentTenths)} used</span>
-        <span className="num mini-reset">{describeQuotaResetCompact(quota.resetsAt)}</span>
-      </span>
-      {pace !== undefined && (
-        <span className={`mini-line mini-pace is-${pace.state}`}>
-          {describePaceState(pace, now)}
-          {vsBaseline !== null && <span className="mini-pace-basis"> · {vsBaseline}</span>}
-          {basis !== null && <span className="mini-pace-basis"> · {basis}</span>}
-        </span>
-      )}
-      <span className="mini-bar">
-        <span
-          className="mini-bar-fill"
-          style={{
-            width: `${quota.usedPercentTenths / 10}%`,
-            background: SOURCE_COLOR[quota.sourceApp],
-          }}
+        <QuotaRows
+          quotas={quotas}
+          pace={pace}
+          projections={projections}
+          health={health}
+          now={now}
         />
-      </span>
+      )}
     </div>
   );
-}
-
-/**
- * What a pool is called under its source's heading.
- *
- * "Cursor Models" below the word "cursor" repeats itself, so the source's name
- * gives way to "own" — the distinction the two pools actually draw. A pool the
- * source does not name is known by its window instead, which is what separates
- * Claude's session from the week around it.
- */
-function poolName(quota: UsageQuota, sourceApp: SourceApp): string {
-  if (quota.label === null) return quotaWindowTag(quota.windowMinutes);
-
-  const label = quota.label.toLowerCase();
-  const source = SOURCE_LABEL[sourceApp];
-  return label.startsWith(`${source} `) ? `own ${label.slice(source.length + 1)}` : label;
 }

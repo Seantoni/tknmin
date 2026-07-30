@@ -34,6 +34,45 @@ export type PaceBasis =
  */
 export type PaceVsBaseline = "noBaseline" | "below" | "typical" | "above" | "farAbove";
 
+/**
+ * A confirmed allowance reading carried forward to the present. Mirrors
+ * `src-tauri/src/domain/projection.rs`.
+ *
+ * Sources publish their percentages on their own schedule — Claude Code
+ * refreshes its cache every several minutes while active and not at all while
+ * idle — but token records are current to seconds. The backend fits the rate
+ * between the two from the source's own history and carries the last confirmed
+ * reading forward. Both numbers travel together so the interface can always
+ * show what was measured beside what was inferred.
+ *
+ * A window is absent from this list whenever the projection was not earned:
+ * too little history, a rate too scattered to trust, nothing spent since the
+ * reading, or a reading too old to project from. Then the confirmed number
+ * stands alone, which is what the interface did before this existed.
+ */
+export interface QuotaProjection {
+  /** Identity, matching the quota's source / label / window so rows join. */
+  sourceApp: SourceApp;
+  label: string | null;
+  windowMinutes: number;
+  /** What the source last actually reported. */
+  confirmedPercentTenths: number;
+  /** When it reported it. */
+  confirmedAt: string;
+  /** Confirmed plus the spend since — what the window is believed to be now. */
+  projectedPercentTenths: number;
+  /** The derived part alone. */
+  addedPercentTenths: number;
+  /** The instant projected to. */
+  projectedAt: string;
+  /** Minutes of open-loop projection. Small is good. */
+  spanMinutes: number;
+  /** How many confirmed-reading pairs the fitted rate rests on. */
+  pairs: number;
+  /** Widest deviation from the fitted rate, as a percent of it. */
+  residualPercent: number;
+}
+
 /** One allowance window's pace and what it implies. */
 export interface WindowPace {
   /** Identity, matching the quota's source / label / window so rows join. */

@@ -17,7 +17,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    build_baseline, evaluate_pace, recent_token_rates, QuotaSample, RecentQuery, ReplaceScope,
+    apply_projections, build_baseline, evaluate_pace, fit_calibrations, project_quotas,
+    recent_token_rates, QuotaProjection, QuotaSample, RecentQuery, ReplaceScope,
     RepositoryRevision, SourceApp, SourceBaseline, SourceCheckpoint, SourceSyncHealth,
     SummaryQuery, UsageQuota, UsageRecord, UsageSummary, WindowPace, BASELINE_DAYS,
     RATE_WINDOW_MINUTES,
@@ -175,12 +176,21 @@ pub struct DashboardSnapshot {
     pub summary: UsageSummary,
     pub recent: Vec<UsageRecord>,
     pub record_count: usize,
+    /// Exactly what the sources reported, never a derived value. The interface
+    /// renders these, and shows any [`Self::projections`] entry beside its row
+    /// as the inferred part.
     pub quotas: Vec<UsageQuota>,
     pub health: Vec<SourceSyncHealth>,
     /// One pace row per live allowance window, computed from the quotas in
     /// this same snapshot so a projection can never sit beside a quota from a
     /// different revision than the one that produced it.
     pub pace: Vec<WindowPace>,
+    /// Confirmed readings carried forward to this snapshot's instant, for the
+    /// windows where a trustworthy rate could be fitted. A window is absent
+    /// when no rate was earned, when nothing was spent since the reading, or
+    /// when the reading is too old to project from — in every one of those
+    /// cases the confirmed number in [`Self::quotas`] stands alone.
+    pub projections: Vec<QuotaProjection>,
 }
 
 /// Read-only access. Everything but the coordinator gets this.
@@ -266,7 +276,7 @@ pub(crate) fn assemble_snapshot(
     let now = Utc::now();
     let revision = reader.revision()?;
     let quotas = reader.quotas()?;
-    let pace = assemble_pace(reader, &quotas, now)?;
+    let (pace, projections) = assemble_risk(reader, &quotas, now)?;
     Ok(DashboardSnapshot {
         revision,
         overview: reader.summary(overview_query)?,
@@ -276,6 +286,7 @@ pub(crate) fn assemble_snapshot(
         quotas,
         health: reader.health()?,
         pace,
+        projections,
     })
 }
 
@@ -292,6 +303,20 @@ pub(crate) fn assemble_pace(
     quotas: &[UsageQuota],
     now: DateTime<Utc>,
 ) -> Result<Vec<WindowPace>, RepositoryError> {
+    Ok(assemble_risk(reader, quotas, now)?.0)
+}
+
+/// Pace and the projections it was computed on, from one read of the history.
+///
+/// The two are produced together because they must agree: a banner saying
+/// "runs out in 40 minutes" beside a percentage that does not reflect the same
+/// burn is worse than either alone. The snapshot needs both; the pace-only
+/// path takes the first and drops the second.
+pub(crate) fn assemble_risk(
+    reader: &dyn UsageReader,
+    quotas: &[UsageQuota],
+    now: DateTime<Utc>,
+) -> Result<(Vec<WindowPace>, Vec<QuotaProjection>), RepositoryError> {
     // Until a backend stores samples this is empty and every pace rests on its
     // window-open rung alone.
     let samples = reader.quota_samples(now - chrono::Duration::days(SAMPLE_HORIZON_DAYS))?;
@@ -308,13 +333,28 @@ pub(crate) fn assemble_pace(
         .map(|source| build_baseline(*source, &history, tz_offset_minutes, now))
         .collect();
     let recent_rates = recent_token_rates(&history, RATE_WINDOW_MINUTES, now);
-    Ok(evaluate_pace(
-        quotas,
-        &samples,
-        &baselines,
-        &recent_rates,
-        tz_offset_minutes,
-        now,
+
+    // A source's allowance percentages are only as fresh as the source chose to
+    // publish them — Claude Code refreshes its cache every several minutes while
+    // active and not at all while idle — but the records are current to seconds.
+    // Fitting the rate between the two from the stored samples lets the confirmed
+    // reading be carried forward, so pace measures the burn as it stands rather
+    // than as it stood at the last publication. Where no rate is earned this is a
+    // no-op and the confirmed reading flows through untouched.
+    let calibrations = fit_calibrations(quotas, &samples, &history);
+    let projections = project_quotas(quotas, &calibrations, &history, now);
+    let projected = apply_projections(quotas, &projections);
+
+    Ok((
+        evaluate_pace(
+            &projected,
+            &samples,
+            &baselines,
+            &recent_rates,
+            tz_offset_minutes,
+            now,
+        ),
+        projections,
     ))
 }
 
@@ -490,6 +530,113 @@ mod tests {
         assert!(!transaction.replace_quotas);
     }
 
+    /// The whole point of the projection, end to end: a source that stopped
+    /// publishing minutes ago, records that did not, and a number that moves.
+    ///
+    /// Claude Code refreshes its allowance cache every several minutes and not
+    /// at all while idle, so between refreshes the confirmed percentage is the
+    /// last thing it said, not the truth. This asserts the snapshot carries the
+    /// confirmed reading untouched *and* a projection that has moved past it.
+    #[test]
+    fn a_source_that_stopped_publishing_still_gets_a_moving_number() {
+        use crate::domain::{
+            CostInfo, DisplayTotal, SourceProvenance, TimestampInterpretation, TokenCounts,
+            TokenField, TotalRule,
+        };
+
+        let repository = InMemoryUsageRepository::new();
+        let now = Utc::now();
+        let ago = |minutes: i64| now - chrono::Duration::minutes(minutes);
+        let resets_at = Some(now + chrono::Duration::hours(3));
+
+        let burn = |minutes: i64, index: u64| UsageRecord {
+            normalization_version: 1,
+            id: format!("burn-{index}"),
+            raw_timestamp: None,
+            event_timestamp_utc: Some(ago(minutes)),
+            timestamp_interpretation: TimestampInterpretation::ExplicitOffset,
+            source_app: SourceApp::ClaudeCode,
+            source_event_id: Some(format!("burn-{index}")),
+            dedupe_key: format!("burn-{index}"),
+            dedupe_algorithm_version: 1,
+            content_hash: format!("hash-{index}"),
+            content_hash_version: 1,
+            provider: None,
+            model: Some("claude-opus-5".to_string()),
+            tokens: TokenCounts {
+                input: TokenField::exact(100_000),
+                output: TokenField::exact(10_000),
+                cached_input: TokenField::exact(0),
+                reasoning: TokenField::unknown(),
+            },
+            reported_total_tokens: None,
+            display_total: Some(DisplayTotal {
+                tokens: 110_000,
+                rule: TotalRule::InputPlusOutput,
+            }),
+            project: None,
+            session_id: None,
+            cost: CostInfo::not_available(),
+            imported_at: ago(minutes),
+            provenance: SourceProvenance {
+                adapter_id: "claude_code".to_string(),
+                adapter_version: "0.3.0".to_string(),
+                source_ref: None,
+            },
+        };
+
+        // Four confirmed readings, ten minutes apart, each preceded by one
+        // call — the history a fitted rate is built from. The last lands 10
+        // minutes ago, which is where the source went quiet.
+        for (step, used) in [(50i64, 0u16), (40, 100), (30, 200), (20, 300)] {
+            let transaction = SourceTransaction {
+                records: vec![burn(step + 5, step as u64)],
+                quotas: vec![UsageQuota {
+                    source_app: SourceApp::ClaudeCode,
+                    label: None,
+                    window_minutes: 300,
+                    used_percent_tenths: used,
+                    resets_at,
+                    observed_at: ago(step),
+                }],
+                ..SourceTransaction::new(SourceApp::ClaudeCode, "claude_code", ago(step))
+            };
+            repository.commit(transaction).unwrap();
+        }
+
+        // Work continues after the last reading; the source says nothing.
+        repository
+            .commit(SourceTransaction {
+                records: vec![burn(5, 999)],
+                ..SourceTransaction::new(SourceApp::ClaudeCode, "claude_code", now)
+            })
+            .unwrap();
+
+        let snapshot = repository
+            .snapshot(&SummaryQuery::default(), &RecentQuery::default())
+            .unwrap();
+
+        // The reported figure is left exactly as reported.
+        let quota = snapshot
+            .quotas
+            .iter()
+            .find(|quota| quota.window_minutes == 300)
+            .expect("the session window is stored");
+        assert_eq!(quota.used_percent_tenths, 300);
+
+        // And beside it, the same window carried forward by the spend since.
+        let projection = snapshot
+            .projections
+            .iter()
+            .find(|projection| projection.window_minutes == 300)
+            .expect("a stale reading with fresh records earns a projection");
+        assert_eq!(projection.confirmed_percent_tenths, 300);
+        assert_eq!(projection.added_percent_tenths, 100);
+        assert_eq!(projection.projected_percent_tenths, 400);
+        assert_eq!(projection.pairs, 3);
+        assert_eq!(projection.residual_percent, 0);
+    }
+
     struct RevisionFirstReader {
         inner: InMemoryUsageRepository,
         revision_read: AtomicBool,
@@ -515,10 +662,7 @@ mod tests {
             self.inner.recent(query)
         }
 
-        fn records_since(
-            &self,
-            since: DateTime<Utc>,
-        ) -> Result<Vec<UsageRecord>, RepositoryError> {
+        fn records_since(&self, since: DateTime<Utc>) -> Result<Vec<UsageRecord>, RepositoryError> {
             self.assert_revision_was_read();
             self.inner.records_since(since)
         }

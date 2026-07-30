@@ -95,7 +95,9 @@ fn dashboard_token() -> Result<Option<String>, AdapterError> {
     let token = match dashboard_entry()?.get_password() {
         Ok(token) if !token.trim().is_empty() => Ok(Some(token)),
         Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(dashboard_error(format!("could not read macOS Keychain: {error}"))),
+        Err(error) => Err(dashboard_error(format!(
+            "could not read macOS Keychain: {error}"
+        ))),
     }?;
     *cache = Some(token.clone());
     Ok(token)
@@ -111,13 +113,19 @@ fn cache_dashboard_token(token: Option<String>) -> Result<(), AdapterError> {
 }
 
 pub fn cursor_connection_status() -> Result<CursorConnectionStatus, AdapterError> {
-    Ok(CursorConnectionStatus { connected: dashboard_token()?.is_some() })
+    Ok(CursorConnectionStatus {
+        connected: dashboard_token()?.is_some(),
+    })
 }
 
-pub fn connect_cursor_dashboard(session_token: &str) -> Result<CursorConnectionStatus, AdapterError> {
+pub fn connect_cursor_dashboard(
+    session_token: &str,
+) -> Result<CursorConnectionStatus, AdapterError> {
     let token = session_token.trim();
     if token.is_empty() || token.contains('\r') || token.contains('\n') {
-        return Err(dashboard_error("the Cursor dashboard session token is invalid".to_string()));
+        return Err(dashboard_error(
+            "the Cursor dashboard session token is invalid".to_string(),
+        ));
     }
     // Validate before storing. The one-event request proves both authentication
     // and endpoint access without downloading the account history twice.
@@ -135,7 +143,9 @@ pub fn disconnect_cursor_dashboard() -> Result<CursorConnectionStatus, AdapterEr
             cache_dashboard_token(None)?;
             Ok(CursorConnectionStatus { connected: false })
         }
-        Err(error) => Err(dashboard_error(format!("could not update macOS Keychain: {error}"))),
+        Err(error) => Err(dashboard_error(format!(
+            "could not update macOS Keychain: {error}"
+        ))),
     }
 }
 
@@ -188,9 +198,8 @@ impl CursorAdapter {
         from: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> Result<String, AdapterError> {
-        let token = dashboard_token()?.ok_or_else(|| {
-            dashboard_error("Cursor dashboard is not connected".to_string())
-        })?;
+        let token = dashboard_token()?
+            .ok_or_else(|| dashboard_error("Cursor dashboard is not connected".to_string()))?;
         let start_ms = from.timestamp_millis().to_string();
         let end_ms = until.timestamp_millis().to_string();
         let client = http_client(Duration::from_secs(20))?;
@@ -271,11 +280,12 @@ impl CursorAdapter {
         let value: serde_json::Value = response
             .json()
             .map_err(|error| quota_error(format!("Cursor usage response was not JSON: {error}")))?;
-        parse_usage_response(&value, Utc::now()).filter(|quotas| !quotas.is_empty()).ok_or_else(|| {
-            quota_error("Cursor usage response did not contain current plan usage".to_string())
-        })
+        parse_usage_response(&value, Utc::now())
+            .filter(|quotas| !quotas.is_empty())
+            .ok_or_else(|| {
+                quota_error("Cursor usage response did not contain current plan usage".to_string())
+            })
     }
-
 }
 
 impl Default for CursorAdapter {
@@ -364,17 +374,16 @@ fn fetch_usage_events_page_with(
             });
         }
         let reason = if status.as_u16() == 401 {
-            "Cursor rejected the session token; copy a fresh WorkosCursorSessionToken"
-                .to_string()
+            "Cursor rejected the session token; copy a fresh WorkosCursorSessionToken".to_string()
         } else {
             format!("Cursor dashboard request returned HTTP {status}")
         };
         return Err(dashboard_error(reason));
     }
 
-    response
-        .json()
-        .map_err(|error| dashboard_error(format!("Cursor dashboard response was not JSON: {error}")))
+    response.json().map_err(|error| {
+        dashboard_error(format!("Cursor dashboard response was not JSON: {error}"))
+    })
 }
 
 /// What the dashboard sync has already pulled.
@@ -482,7 +491,9 @@ impl CursorAdapter {
         let full_window = request.now - chrono::Duration::days(DASHBOARD_WINDOW_DAYS);
 
         let from = match (request.mode, stored.watermark_ms.and_then(instant_ms)) {
-            (SyncMode::Incremental, Some(watermark)) => (watermark - DELTA_OVERLAP).max(full_window),
+            (SyncMode::Incremental, Some(watermark)) => {
+                (watermark - DELTA_OVERLAP).max(full_window)
+            }
             _ => full_window,
         };
 
@@ -602,7 +613,11 @@ impl CursorAdapter {
     /// Size and modification time of the local database and its write-ahead
     /// log — the cheapest possible "did anything happen".
     fn local_state(&self) -> LocalCheckpoint {
-        let size = |path: PathBuf| fs::metadata(&path).map(|meta| meta.len()).unwrap_or_default();
+        let size = |path: PathBuf| {
+            fs::metadata(&path)
+                .map(|meta| meta.len())
+                .unwrap_or_default()
+        };
         let modified_ms = fs::metadata(&self.db_path)
             .and_then(|meta| meta.modified())
             .ok()
@@ -624,10 +639,13 @@ impl CursorAdapter {
                 .ok()
                 .map(DateTime::<Utc>::from)
         };
-        [newest(self.db_path.clone()), newest(wal_path(&self.db_path))]
-            .into_iter()
-            .flatten()
-            .max()
+        [
+            newest(self.db_path.clone()),
+            newest(wal_path(&self.db_path)),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
     }
 
     /// Locate this adapter's sources. Kept for tests and diagnostics; the
@@ -688,10 +706,11 @@ impl CursorAdapter {
         }
 
         let connection = self.open_db()?;
-        let content = extract_bubbles_jsonl(&connection).map_err(|error| AdapterError::Unreadable {
-            adapter: Self::ID,
-            reason: error,
-        })?;
+        let content =
+            extract_bubbles_jsonl(&connection).map_err(|error| AdapterError::Unreadable {
+                adapter: Self::ID,
+                reason: error,
+            })?;
 
         Ok(RawSourceInput {
             source_ref: Some(source.source_ref.clone()),
@@ -714,13 +733,20 @@ impl CursorAdapter {
                 Ok(bubble) => bubble,
                 Err(_) => continue,
             };
-            by_conversation.entry(bubble.conversation_id.clone()).or_default().push(bubble);
+            by_conversation
+                .entry(bubble.conversation_id.clone())
+                .or_default()
+                .push(bubble);
         }
 
         let mut drafts = Vec::new();
         for mut bubbles in by_conversation.into_values() {
             bubbles.sort_by(|left, right| left.created_at.cmp(&right.created_at));
-            drafts.extend(drafts_for_conversation(self, input.source_ref.as_deref(), &bubbles));
+            drafts.extend(drafts_for_conversation(
+                self,
+                input.source_ref.as_deref(),
+                &bubbles,
+            ));
         }
 
         // Stable order for reproducible imports.
@@ -734,24 +760,29 @@ impl CursorAdapter {
 }
 
 fn quota_error(reason: String) -> AdapterError {
-    AdapterError::Unreadable { adapter: CursorAdapter::ID, reason }
+    AdapterError::Unreadable {
+        adapter: CursorAdapter::ID,
+        reason,
+    }
 }
 
 fn dashboard_error(reason: String) -> AdapterError {
-    AdapterError::Unreadable { adapter: CursorAdapter::ID, reason }
+    AdapterError::Unreadable {
+        adapter: CursorAdapter::ID,
+        reason,
+    }
 }
 
 fn parse_dashboard_events(
     adapter: &CursorAdapter,
     input: &RawSourceInput,
 ) -> Result<Vec<UsageRecordDraft>, AdapterError> {
-    let root: serde_json::Value = serde_json::from_str(&input.content).map_err(|error| {
-        AdapterError::Parse {
+    let root: serde_json::Value =
+        serde_json::from_str(&input.content).map_err(|error| AdapterError::Parse {
             adapter: CursorAdapter::ID,
             entry: 0,
             reason: format!("dashboard response was invalid: {error}"),
-        }
-    })?;
+        })?;
     let events = root
         .get("usageEventsDisplay")
         .and_then(serde_json::Value::as_array)
@@ -779,29 +810,38 @@ fn parse_dashboard_events(
         *occurrence += 1;
 
         let token_usage = event.get("tokenUsage");
-        let input_tokens = token_usage.and_then(|usage| usage.get("inputTokens")).and_then(json_u64);
-        let cache_write =
-            token_usage.and_then(|usage| usage.get("cacheWriteTokens")).and_then(json_u64);
-        let output_tokens =
-            token_usage.and_then(|usage| usage.get("outputTokens")).and_then(json_u64);
-        let cache_read =
-            token_usage.and_then(|usage| usage.get("cacheReadTokens")).and_then(json_u64);
+        let input_tokens = token_usage
+            .and_then(|usage| usage.get("inputTokens"))
+            .and_then(json_u64);
+        let cache_write = token_usage
+            .and_then(|usage| usage.get("cacheWriteTokens"))
+            .and_then(json_u64);
+        let output_tokens = token_usage
+            .and_then(|usage| usage.get("outputTokens"))
+            .and_then(json_u64);
+        let cache_read = token_usage
+            .and_then(|usage| usage.get("cacheReadTokens"))
+            .and_then(json_u64);
         let input_field = match (input_tokens, cache_write) {
             (None, None) => TokenField::unknown(),
-            (input, write) => {
-                TokenField::exact(input.unwrap_or_default().saturating_add(write.unwrap_or_default()))
-            }
+            (input, write) => TokenField::exact(
+                input
+                    .unwrap_or_default()
+                    .saturating_add(write.unwrap_or_default()),
+            ),
         };
 
-        let mut draft =
-            UsageRecordDraft::new(SourceApp::Cursor, adapter.provenance(input.source_ref.as_deref()))
-                .with_source_event_id(source_event_id)
-                .with_tokens(TokenCounts {
-                    input: input_field,
-                    output: output_tokens.map_or_else(TokenField::unknown, TokenField::exact),
-                    cached_input: cache_read.map_or_else(TokenField::unknown, TokenField::exact),
-                    reasoning: TokenField::unknown(),
-                });
+        let mut draft = UsageRecordDraft::new(
+            SourceApp::Cursor,
+            adapter.provenance(input.source_ref.as_deref()),
+        )
+        .with_source_event_id(source_event_id)
+        .with_tokens(TokenCounts {
+            input: input_field,
+            output: output_tokens.map_or_else(TokenField::unknown, TokenField::exact),
+            cached_input: cache_read.map_or_else(TokenField::unknown, TokenField::exact),
+            reasoning: TokenField::unknown(),
+        });
         if let Some(timestamp) = event_timestamp(event) {
             draft.raw_timestamp = Some(timestamp);
         }
@@ -947,7 +987,10 @@ fn parse_usage_response(
         .unwrap_or(BILLING_MONTH_MINUTES);
 
     let pools = [
-        ("Cursor Models", plan.get("autoPercentUsed").and_then(number)),
+        (
+            "Cursor Models",
+            plan.get("autoPercentUsed").and_then(number),
+        ),
         ("Other Models", plan.get("apiPercentUsed").and_then(number)),
     ];
     let mut quotas: Vec<_> = pools
@@ -992,7 +1035,9 @@ fn instant(value: &serde_json::Value) -> Option<DateTime<Utc>> {
     if let Ok(milliseconds) = text.parse::<i64>() {
         return DateTime::from_timestamp_millis(milliseconds);
     }
-    DateTime::parse_from_rfc3339(text).ok().map(|date| date.to_utc())
+    DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|date| date.to_utc())
 }
 
 fn percent_to_tenths(percent: f64) -> u16 {
@@ -1052,7 +1097,12 @@ fn drafts_for_conversation(
         // Token-bearing assistants outside a user-turn window (orphans, or
         // the walk's first sight of them) are imported on their own.
         if bubble.is_assistant() && bubble.has_tokens() {
-            drafts.push(token_draft(adapter, source_ref, bubble, last_model.as_deref()));
+            drafts.push(token_draft(
+                adapter,
+                source_ref,
+                bubble,
+                last_model.as_deref(),
+            ));
             index += 1;
             continue;
         }
@@ -1163,7 +1213,9 @@ fn extract_bubbles_jsonl(connection: &Connection) -> Result<String, String> {
 
     for row in rows {
         let (key, value) = row.map_err(|error| error.to_string())?;
-        let Some(bubble) = compact_from_row(&key, &value) else { continue };
+        let Some(bubble) = compact_from_row(&key, &value) else {
+            continue;
+        };
         let line = serde_json::to_string(&bubble).map_err(|error| error.to_string())?;
         content.push_str(&line);
         content.push('\n');
@@ -1248,9 +1300,10 @@ fn open_readonly(path: &Path) -> Result<Connection, AdapterError> {
     // the DB open and the image looks torn, fall back to immutable mode —
     // slightly staler, but never fights the writer.
     let uri = format!("file:{}?mode=ro", path.display());
-    if let Ok(connection) =
-        Connection::open_with_flags(&uri, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)
-    {
+    if let Ok(connection) = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    ) {
         // Touch the table once so a malformed open fails here, not mid-scan.
         if connection
             .query_row("SELECT 1 FROM cursorDiskKV LIMIT 1", [], |_| Ok(()))
@@ -1279,8 +1332,7 @@ fn open_readonly(path: &Path) -> Result<Connection, AdapterError> {
 }
 
 fn default_state_db() -> PathBuf {
-    home()
-        .join("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+    home().join("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
 }
 
 fn home() -> PathBuf {
@@ -1317,7 +1369,10 @@ mod tests {
         //   → the assistant
         assert_eq!(drafts.len(), 3);
 
-        let tokened: Vec<_> = drafts.iter().filter(|d| d.tokens.input.is_known()).collect();
+        let tokened: Vec<_> = drafts
+            .iter()
+            .filter(|d| d.tokens.input.is_known())
+            .collect();
         assert_eq!(tokened.len(), 2);
         assert_eq!(tokened[0].tokens.input, TokenField::exact(52_966));
         assert_eq!(tokened[0].tokens.output, TokenField::exact(14_911));
@@ -1331,7 +1386,10 @@ mod tests {
             Some("e09dc0ed-465b-4f71-9fb5-f3ba08e03288")
         );
 
-        let events: Vec<_> = drafts.iter().filter(|d| !d.tokens.input.is_known()).collect();
+        let events: Vec<_> = drafts
+            .iter()
+            .filter(|d| !d.tokens.input.is_known())
+            .collect();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].model.as_deref(), Some("grok-4.5"));
         assert_eq!(
@@ -1343,10 +1401,14 @@ mod tests {
 
     #[test]
     fn event_ids_are_stable_across_parses() {
-        let first: Vec<_> =
-            parse_sample().into_iter().map(|d| d.source_event_id.unwrap()).collect();
-        let second: Vec<_> =
-            parse_sample().into_iter().map(|d| d.source_event_id.unwrap()).collect();
+        let first: Vec<_> = parse_sample()
+            .into_iter()
+            .map(|d| d.source_event_id.unwrap())
+            .collect();
+        let second: Vec<_> = parse_sample()
+            .into_iter()
+            .map(|d| d.source_event_id.unwrap())
+            .collect();
         assert_eq!(first, second);
     }
 
@@ -1381,7 +1443,10 @@ mod tests {
         assert_eq!(draft.tokens.output, TokenField::exact(20_525));
         assert_eq!(draft.tokens.cached_input, TokenField::exact(99));
         assert_eq!(draft.provider.as_deref(), Some("anthropic"));
-        assert_eq!(draft.model.as_deref(), Some("claude-4.6-opus-high-thinking"));
+        assert_eq!(
+            draft.model.as_deref(),
+            Some("claude-4.6-opus-high-thinking")
+        );
         assert_eq!(
             draft.cost.as_ref().and_then(|cost| cost.amount.as_ref()),
             Some(&Money::new(12_473, "USD", 4).unwrap())
@@ -1454,8 +1519,9 @@ mod tests {
 
     #[test]
     fn parses_current_period_usage_into_a_billing_cycle_quota() {
-        let observed_at =
-            DateTime::parse_from_rfc3339("2026-07-29T21:00:00Z").unwrap().to_utc();
+        let observed_at = DateTime::parse_from_rfc3339("2026-07-29T21:00:00Z")
+            .unwrap()
+            .to_utc();
         let value = serde_json::json!({
             "billingCycleStart": "2026-07-01T00:00:00Z",
             "billingCycleEnd": "2026-08-01T00:00:00Z",
@@ -1507,22 +1573,23 @@ mod tests {
     #[test]
     fn rejects_usage_responses_without_a_reset_or_percentage() {
         assert!(parse_usage_response(&serde_json::json!({}), Utc::now()).is_none());
-        assert!(
-            parse_usage_response(
-                &serde_json::json!({
-                    "billingCycleEnd": "2026-08-01T00:00:00Z",
-                    "planUsage": {}
-                }),
-                Utc::now()
-            )
-            .is_none()
-        );
+        assert!(parse_usage_response(
+            &serde_json::json!({
+                "billingCycleEnd": "2026-08-01T00:00:00Z",
+                "planUsage": {}
+            }),
+            Utc::now()
+        )
+        .is_none());
     }
 
     #[test]
     fn reports_discovery_failure_when_no_db_exists() {
         let adapter = CursorAdapter::with_db(PathBuf::from("/definitely/not/here.vscdb"));
-        assert!(matches!(adapter.discover(), Err(AdapterError::Discovery { .. })));
+        assert!(matches!(
+            adapter.discover(),
+            Err(AdapterError::Discovery { .. })
+        ));
     }
 
     fn dashboard_event(cents: f64, model: &str, timestamp: &str) -> serde_json::Value {

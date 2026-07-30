@@ -8,10 +8,7 @@ use tokens_lib::state::AppState;
 
 fn dashboard_data() -> (tokens_lib::domain::UsageSummary, Vec<UsageRecord>) {
     let state = AppState::with_fake_data();
-    let summary = state
-        .reader()
-        .summary(&SummaryQuery::default())
-        .unwrap();
+    let summary = state.reader().summary(&SummaryQuery::default()).unwrap();
     // The table asks for the same records, so every row is covered below.
     let recent = state
         .reader()
@@ -160,10 +157,7 @@ fn an_empty_store_reports_zero_records() {
     let state = AppState::in_memory();
     assert_eq!(state.reader().count().unwrap(), 0);
 
-    let summary = state
-        .reader()
-        .summary(&SummaryQuery::default())
-        .unwrap();
+    let summary = state.reader().summary(&SummaryQuery::default()).unwrap();
     assert_eq!(summary.totals.record_count, 0);
     assert!(summary.by_source.is_empty());
     assert!(state

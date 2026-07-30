@@ -25,7 +25,7 @@ pub const MINI_LABEL: &str = "mini";
 /// Narrow enough to park in a corner. The height here only has to carry the
 /// first paint: the interface measures its own content and resizes to it, since
 /// how many rows there are depends on what the sources report.
-const MINI_WIDTH: f64 = 268.0;
+const MINI_WIDTH: f64 = 300.0;
 const MINI_HEIGHT: f64 = 200.0;
 
 /// Build the compact window, hidden. Called once during setup, on the main

@@ -237,6 +237,10 @@ export interface DashboardSnapshot {
   summary: UsageSummary;
   recent: UsageRecord[];
   recordCount: number;
+  /**
+   * Exactly what the sources reported, never a derived value. Any matching
+   * entry in {@link DashboardSnapshot.projections} carries the inferred part.
+   */
   quotas: UsageQuota[];
   health: SourceSyncHealth[];
   /**
@@ -245,6 +249,12 @@ export interface DashboardSnapshot {
    * revision than the one that produced it.
    */
   pace: import("./pace").WindowPace[];
+  /**
+   * Confirmed readings carried forward to this snapshot's instant, for the
+   * windows where a trustworthy rate could be fitted. Absent means the
+   * confirmed number in {@link DashboardSnapshot.quotas} stands alone.
+   */
+  projections: import("./pace").QuotaProjection[];
 }
 
 /**

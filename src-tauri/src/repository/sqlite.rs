@@ -299,7 +299,7 @@ impl UsageReader for SqliteUsageRepository {
     }
 
     fn quotas(&self) -> Result<Vec<UsageQuota>, RepositoryError> {
-        self.with_connection(|connection| read_quotas(connection))
+        self.with_connection(read_quotas)
     }
 
     fn quota_samples(&self, since: DateTime<Utc>) -> Result<Vec<QuotaSample>, RepositoryError> {
@@ -327,11 +327,11 @@ impl UsageReader for SqliteUsageRepository {
     }
 
     fn health(&self) -> Result<Vec<SourceSyncHealth>, RepositoryError> {
-        self.with_connection(|connection| read_health(connection))
+        self.with_connection(read_health)
     }
 
     fn revision(&self) -> Result<RepositoryRevision, RepositoryError> {
-        self.with_connection(|connection| read_revision(connection))
+        self.with_connection(read_revision)
     }
 
     fn checkpoints(&self, adapter_id: &str) -> Result<Vec<SourceCheckpoint>, RepositoryError> {

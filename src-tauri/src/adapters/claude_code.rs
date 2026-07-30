@@ -194,14 +194,18 @@ impl SourceAdapter for ClaudeCodeAdapter {
             let (appended, read_to, restarted) = match read_from_offset(&path, stored.offset) {
                 Ok(result) => result,
                 Err(error) => {
-                    delta
-                        .failures
-                        .push(format!("a Claude Code transcript could not be read: {error}"));
+                    delta.failures.push(format!(
+                        "a Claude Code transcript could not be read: {error}"
+                    ));
                     continue;
                 }
             };
 
-            let carried = if restarted { String::new() } else { stored.partial };
+            let carried = if restarted {
+                String::new()
+            } else {
+                stored.partial
+            };
             let text = format!("{carried}{appended}");
             let (complete, partial) = split_complete_lines(&text);
 
@@ -212,7 +216,9 @@ impl SourceAdapter for ClaudeCodeAdapter {
                 .map(|relative| relative.trim_end_matches(".jsonl").to_string())
                 .unwrap_or_else(|| source_key.clone());
 
-            delta.drafts.extend(parse_transcript(self, &source_ref, complete));
+            delta
+                .drafts
+                .extend(parse_transcript(self, &source_ref, complete));
             delta.checkpoints.push(SourceCheckpoint {
                 adapter_id: Self::ID.to_string(),
                 source_key,
@@ -341,7 +347,11 @@ impl ClaudeCodeAdapter {
                 // others; when present they bind just as hard as the rest.
                 // They share the week's length, so only the label tells them
                 // apart from the overall cap — and from each other.
-                (Some("Opus"), WEEK_WINDOW_MINUTES, utilization.seven_day_opus),
+                (
+                    Some("Opus"),
+                    WEEK_WINDOW_MINUTES,
+                    utilization.seven_day_opus,
+                ),
                 (
                     Some("Sonnet"),
                     WEEK_WINDOW_MINUTES,
@@ -1118,10 +1128,7 @@ mod tests {
     }
 
     /// Run one delta, feeding back the checkpoints the previous one produced.
-    fn tail(
-        adapter: &ClaudeCodeAdapter,
-        carried: &mut Vec<SourceCheckpoint>,
-    ) -> SourceDelta {
+    fn tail(adapter: &ClaudeCodeAdapter, carried: &mut Vec<SourceCheckpoint>) -> SourceDelta {
         let request = DeltaRequest {
             mode: SyncMode::Incremental,
             checkpoints: carried.clone(),
@@ -1181,7 +1188,10 @@ mod tests {
         assert_eq!(first.drafts[0].tokens.output, TokenField::exact(5));
 
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(file, "{}", assistant_line("msg_01", 214)).unwrap();
         drop(file);
 
@@ -1207,7 +1217,11 @@ mod tests {
 
         // A Task tool subagent creates its directory mid-session; its usage
         // appears nowhere else, so the walk has to find it on the next pass.
-        let nested = root.join(PROJECTS_DIR).join("app").join("s1").join("subagents");
+        let nested = root
+            .join(PROJECTS_DIR)
+            .join("app")
+            .join("s1")
+            .join("subagents");
         fs::create_dir_all(&nested).unwrap();
         fs::write(
             nested.join("agent-1.jsonl"),

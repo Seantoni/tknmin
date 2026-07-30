@@ -412,7 +412,8 @@ impl Scheduler {
         let mut last_tick = Instant::now();
 
         loop {
-            let wait = self.next_wakeup(&[next_metadata_reconcile, next_full_reconcile, next_quota]);
+            let wait =
+                self.next_wakeup(&[next_metadata_reconcile, next_full_reconcile, next_quota]);
 
             match inbox.recv_timeout(wait) {
                 Ok(Message::Trigger(trigger)) => self.accept(trigger),
@@ -537,7 +538,11 @@ impl Scheduler {
                 // The cheap pass: incremental mode means each source checks
                 // metadata and reads only what actually moved, so a dropped
                 // watcher event is repaired without re-reading any history.
-                self.enqueue_all(SyncMode::Incremental, RefreshCategory::Usage, Duration::ZERO)
+                self.enqueue_all(
+                    SyncMode::Incremental,
+                    RefreshCategory::Usage,
+                    Duration::ZERO,
+                )
             }
         }
     }
@@ -847,7 +852,9 @@ fn run_job(
         // durable and readable. Publishing before the commit would let a
         // listener refetch a revision that does not exist yet.
         debug_assert!(
-            writer.revision().is_ok_and(|current| current >= outcome.revision),
+            writer
+                .revision()
+                .is_ok_and(|current| current >= outcome.revision),
             "published a revision the store does not hold"
         );
         observer.publish(&DataChanged {

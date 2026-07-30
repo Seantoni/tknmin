@@ -21,8 +21,7 @@ fn main() {
     let repository = Arc::new(InMemoryUsageRepository::new());
     let started = Instant::now();
 
-    let refresh =
-        RefreshCoordinator::new(repository.clone(), Arc::new(SilentObserver)).start();
+    let refresh = RefreshCoordinator::new(repository.clone(), Arc::new(SilentObserver)).start();
     refresh.submit(RefreshTrigger::Startup);
 
     // Give the lanes a moment to claim their work before watching them empty.
