@@ -137,8 +137,8 @@ export function SettingsView({
           <span className="label">alert thresholds</span>
         </div>
         <p className="settings-lead">
-          Warn when a source’s allowance crosses the line you set — by percent left, or by time
-          until reset.
+          Warn when a source’s allowance crosses the line you set — by percent left, by time until
+          reset, or when the current pace is projected to run it out early.
         </p>
 
         <ul className="threshold-list">

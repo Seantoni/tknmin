@@ -22,19 +22,99 @@ use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::domain::{
-    RecentQuery, RepositoryRevision, SourceApp, SourceCheckpoint, SourceSyncHealth, SummaryQuery,
-    SyncState, UsageQuota, UsageRecord, UsageSummary,
+    QuotaSample, RecentQuery, RepositoryRevision, SourceApp, SourceCheckpoint, SourceSyncHealth,
+    SummaryQuery, SyncState, UsageQuota, UsageRecord, UsageSummary, WindowPace,
 };
 
 use super::summarize;
 use super::{
-    apply_health, assemble_snapshot, materially_differs, merge_quota, quota_key, CommitCounts, CommitOutcome,
-    DashboardSnapshot, RepositoryError, SourceTransaction, UsageReader, UsageWriter,
+    apply_health, assemble_pace_only, assemble_snapshot, materially_differs, merge_quota,
+    quota_key, CommitCounts, CommitOutcome, DashboardSnapshot, RepositoryError, SourceTransaction,
+    UsageReader, UsageWriter,
 };
 
 /// Bumped whenever the stored shape changes. Migrations run in order and are
 /// recorded, so an older install upgrades in place instead of starting over.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
+
+/// The base shape, created for a fresh store. `quota_samples` is *not* here:
+/// it arrives as migration 2, so a store written before it existed upgrades
+/// to exactly the same shape a new store ends in.
+const BASE_SCHEMA: &str = r#"
+    CREATE TABLE IF NOT EXISTS meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS records (
+        dedupe_key            TEXT PRIMARY KEY,
+        content_hash          TEXT NOT NULL,
+        source_app            TEXT NOT NULL,
+        adapter_id            TEXT NOT NULL,
+        event_timestamp_utc   INTEGER,
+        normalization_version INTEGER NOT NULL,
+        payload               TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS records_by_source_time
+        ON records (source_app, event_timestamp_utc);
+    CREATE INDEX IF NOT EXISTS records_by_adapter_time
+        ON records (adapter_id, event_timestamp_utc);
+
+    CREATE TABLE IF NOT EXISTS checkpoints (
+        adapter_id TEXT NOT NULL,
+        source_key TEXT NOT NULL,
+        payload    TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (adapter_id, source_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS quotas (
+        source_app          TEXT NOT NULL,
+        label               TEXT NOT NULL,
+        window_minutes      INTEGER NOT NULL,
+        used_percent_tenths INTEGER NOT NULL,
+        resets_at           INTEGER,
+        observed_at         INTEGER NOT NULL,
+        PRIMARY KEY (source_app, label, window_minutes)
+    );
+
+    CREATE TABLE IF NOT EXISTS source_health (
+        source_app         TEXT PRIMARY KEY,
+        state              TEXT NOT NULL,
+        app_synced_at      INTEGER,
+        source_observed_at INTEGER,
+        last_attempt_at    INTEGER,
+        last_error         TEXT,
+        awaiting_upstream  INTEGER NOT NULL DEFAULT 0
+    );
+"#;
+
+/// Ordered migrations, applied in sequence after the base schema. Each runs
+/// inside its own transaction together with the version stamp that records
+/// it, so an upgrade either lands a whole step or none of it.
+///
+/// `quota_samples` holds one historical observation per quota change. The
+/// quota lane polls about once a minute but a row is written only when the
+/// value moves, so the table holds deltas rather than polls. `resets_at` is
+/// carried per row because it identifies the window instance: a delta is only
+/// ever taken between samples sharing one. All instants are milliseconds since
+/// the Unix epoch, like every other timestamp in this schema.
+const MIGRATIONS: &[(u32, &str)] = &[(
+    2,
+    r#"
+    CREATE TABLE IF NOT EXISTS quota_samples (
+        source_app          TEXT NOT NULL,
+        label               TEXT NOT NULL,
+        window_minutes      INTEGER NOT NULL,
+        used_percent_tenths INTEGER NOT NULL,
+        resets_at           INTEGER,
+        observed_at         INTEGER NOT NULL,
+        PRIMARY KEY (source_app, label, window_minutes, observed_at)
+    );
+    CREATE INDEX IF NOT EXISTS quota_samples_recent
+        ON quota_samples (source_app, label, window_minutes, observed_at DESC);
+    "#,
+)];
 
 const META_REVISION: &str = "revision";
 
@@ -60,7 +140,7 @@ impl SqliteUsageRepository {
         Self::prepare(connection)
     }
 
-    fn prepare(connection: Connection) -> Result<Self, RepositoryError> {
+    fn prepare(mut connection: Connection) -> Result<Self, RepositoryError> {
         // WAL lets the interface read while a source commits. `NORMAL` is the
         // right durability for derived data: the logs on disk remain the
         // authority, so the worst a lost transaction costs is a re-read.
@@ -74,7 +154,7 @@ impl SqliteUsageRepository {
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| backend(&error))?;
 
-        migrate(&connection)?;
+        migrate(&mut connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -119,64 +199,15 @@ impl SqliteUsageRepository {
     }
 }
 
-fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
+fn migrate(connection: &mut Connection) -> Result<(), RepositoryError> {
     connection
-        .execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS meta (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS records (
-                dedupe_key            TEXT PRIMARY KEY,
-                content_hash          TEXT NOT NULL,
-                source_app            TEXT NOT NULL,
-                adapter_id            TEXT NOT NULL,
-                event_timestamp_utc   INTEGER,
-                normalization_version INTEGER NOT NULL,
-                payload               TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS records_by_source_time
-                ON records (source_app, event_timestamp_utc);
-            CREATE INDEX IF NOT EXISTS records_by_adapter_time
-                ON records (adapter_id, event_timestamp_utc);
-
-            CREATE TABLE IF NOT EXISTS checkpoints (
-                adapter_id TEXT NOT NULL,
-                source_key TEXT NOT NULL,
-                payload    TEXT NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (adapter_id, source_key)
-            );
-
-            CREATE TABLE IF NOT EXISTS quotas (
-                source_app          TEXT NOT NULL,
-                label               TEXT NOT NULL,
-                window_minutes      INTEGER NOT NULL,
-                used_percent_tenths INTEGER NOT NULL,
-                resets_at           INTEGER,
-                observed_at         INTEGER NOT NULL,
-                PRIMARY KEY (source_app, label, window_minutes)
-            );
-
-            CREATE TABLE IF NOT EXISTS source_health (
-                source_app         TEXT PRIMARY KEY,
-                state              TEXT NOT NULL,
-                app_synced_at      INTEGER,
-                source_observed_at INTEGER,
-                last_attempt_at    INTEGER,
-                last_error         TEXT,
-                awaiting_upstream  INTEGER NOT NULL DEFAULT 0
-            );
-            "#,
-        )
+        .execute_batch(BASE_SCHEMA)
         .map_err(|error| backend(&error))?;
 
     connection
         .execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1), ('revision', '0')",
-            params![SCHEMA_VERSION.to_string()],
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1'), ('revision', '0')",
+            [],
         )
         .map_err(|error| backend(&error))?;
 
@@ -195,13 +226,24 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
             "the usage store was written by a newer version of Tokens (schema {stored})"
         )));
     }
-    if stored < SCHEMA_VERSION {
-        connection
+
+    // Apply each pending migration in order, stamping its version inside the
+    // same transaction so a step either lands whole or not at all.
+    for (version, sql) in MIGRATIONS {
+        if stored >= *version {
+            continue;
+        }
+        let transaction = connection.transaction().map_err(|error| backend(&error))?;
+        transaction
+            .execute_batch(sql)
+            .map_err(|error| backend(&error))?;
+        transaction
             .execute(
                 "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
-                params![SCHEMA_VERSION.to_string()],
+                params![version.to_string()],
             )
             .map_err(|error| backend(&error))?;
+        transaction.commit().map_err(|error| backend(&error))?;
     }
 
     Ok(())
@@ -212,7 +254,9 @@ impl UsageReader for SqliteUsageRepository {
         self.with_connection(|connection| {
             let all = SqliteUsageRepository::load_all(connection)?;
             let undated = summarize::undated_excluded(all.iter(), query);
-            let matching = all.iter().filter(|record| summarize::matches(record, query));
+            let matching = all
+                .iter()
+                .filter(|record| summarize::matches(record, query));
             Ok(summarize::summarize(matching, Utc::now(), undated))
         })
     }
@@ -224,17 +268,62 @@ impl UsageReader for SqliteUsageRepository {
         })
     }
 
+    fn records_since(&self, since: DateTime<Utc>) -> Result<Vec<UsageRecord>, RepositoryError> {
+        self.with_connection(|connection| {
+            // The one read that bounds itself in SQL: `event_timestamp_utc` is
+            // indexed, so a month of history costs a range scan rather than
+            // deserializing every payload in the store.
+            let mut statement = connection
+                .prepare("SELECT payload FROM records WHERE event_timestamp_utc >= ?1")?;
+            let rows = statement.query_map(params![since.timestamp_millis()], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut records = Vec::new();
+            for row in rows {
+                // A row this build cannot deserialize is from a newer schema or
+                // a corrupt write; skipping it keeps the rest alive.
+                if let Ok(record) = serde_json::from_str::<UsageRecord>(&row?) {
+                    records.push(record);
+                }
+            }
+            Ok(records)
+        })
+    }
+
     fn count(&self) -> Result<usize, RepositoryError> {
         self.with_connection(|connection| {
-            let count: i64 = connection.query_row("SELECT COUNT(*) FROM records", [], |row| {
-                row.get(0)
-            })?;
+            let count: i64 =
+                connection.query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))?;
             Ok(count as usize)
         })
     }
 
     fn quotas(&self) -> Result<Vec<UsageQuota>, RepositoryError> {
         self.with_connection(|connection| read_quotas(connection))
+    }
+
+    fn quota_samples(&self, since: DateTime<Utc>) -> Result<Vec<QuotaSample>, RepositoryError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT source_app, label, window_minutes, used_percent_tenths, resets_at, observed_at
+                 FROM quota_samples WHERE observed_at >= ?1
+                 ORDER BY source_app, label, window_minutes, observed_at",
+            )?;
+            let rows = statement.query_map(params![since.timestamp_millis()], |row| {
+                let source: String = row.get(0)?;
+                let label: String = row.get(1)?;
+                Ok(SourceApp::from_str(&source).ok().map(|source_app| QuotaSample {
+                    source_app,
+                    label: (!label.is_empty()).then_some(label),
+                    window_minutes: row.get::<_, i64>(2).unwrap_or_default() as u32,
+                    used_percent_tenths: row.get::<_, i64>(3).unwrap_or_default() as u16,
+                    resets_at: row.get::<_, Option<i64>>(4).unwrap_or_default().and_then(instant),
+                    observed_at: instant(row.get::<_, i64>(5).unwrap_or_default())
+                        .unwrap_or_else(Utc::now),
+                }))
+            })?;
+            Ok(rows.filter_map(|row| row.ok().flatten()).collect())
+        })
     }
 
     fn health(&self) -> Result<Vec<SourceSyncHealth>, RepositoryError> {
@@ -274,6 +363,10 @@ impl UsageReader for SqliteUsageRepository {
     ) -> Result<DashboardSnapshot, RepositoryError> {
         assemble_snapshot(self, overview, recent)
     }
+
+    fn pace(&self) -> Result<Vec<WindowPace>, RepositoryError> {
+        assemble_pace_only(self)
+    }
 }
 
 impl UsageWriter for SqliteUsageRepository {
@@ -282,9 +375,7 @@ impl UsageWriter for SqliteUsageRepository {
             .connection
             .lock()
             .map_err(|_| RepositoryError::Unavailable)?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| backend(&error))?;
+        let transaction = connection.transaction().map_err(|error| backend(&error))?;
 
         let outcome = apply(&transaction, batch).map_err(|error| backend(&error))?;
 
@@ -293,6 +384,15 @@ impl UsageWriter for SqliteUsageRepository {
         // store does not have, and the next run would skip past it forever.
         transaction.commit().map_err(|error| backend(&error))?;
         Ok(outcome)
+    }
+
+    fn prune_quota_samples(&self, before: DateTime<Utc>) -> Result<usize, RepositoryError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM quota_samples WHERE observed_at < ?1",
+                params![before.timestamp_millis()],
+            )
+        })
     }
 }
 
@@ -352,9 +452,8 @@ fn apply(
             None => counts.inserted += 1,
         }
 
-        let payload = serde_json::to_string(record).map_err(|error| {
-            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
-        })?;
+        let payload = serde_json::to_string(record)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         transaction.execute(
             "INSERT INTO records
                 (dedupe_key, content_hash, source_app, adapter_id,
@@ -431,6 +530,40 @@ fn apply(
                 incoming.observed_at.timestamp_millis(),
             ],
         )?;
+
+        // Sample for pace history — only when the value or the window
+        // instance moved, so the table holds deltas rather than polls. The
+        // live quota row carries the advancing observation time; the sample
+        // table only needs the points where something actually changed.
+        let label = incoming.label.clone().unwrap_or_default();
+        let last: Option<(i64, Option<i64>)> = transaction
+            .query_row(
+                "SELECT used_percent_tenths, resets_at FROM quota_samples
+                 WHERE source_app = ?1 AND label = ?2 AND window_minutes = ?3
+                 ORDER BY observed_at DESC LIMIT 1",
+                params![incoming.source_app.as_str(), label, incoming.window_minutes],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let moved = last.is_none_or(|(used, resets)| {
+            used != i64::from(incoming.used_percent_tenths)
+                || resets != incoming.resets_at.map(|at| at.timestamp_millis())
+        });
+        if moved {
+            transaction.execute(
+                "INSERT INTO quota_samples
+                    (source_app, label, window_minutes, used_percent_tenths, resets_at, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    incoming.source_app.as_str(),
+                    label,
+                    incoming.window_minutes,
+                    incoming.used_percent_tenths,
+                    incoming.resets_at.map(|at| at.timestamp_millis()),
+                    incoming.observed_at.timestamp_millis(),
+                ],
+            )?;
+        }
     }
 
     for checkpoint in &batch.checkpoints {
@@ -523,14 +656,20 @@ fn read_quotas(connection: &Connection) -> Result<Vec<UsageQuota>, rusqlite::Err
     let rows = statement.query_map([], |row| {
         let source: String = row.get(0)?;
         let label: String = row.get(1)?;
-        Ok(SourceApp::from_str(&source).ok().map(|source_app| UsageQuota {
-            source_app,
-            label: (!label.is_empty()).then_some(label),
-            window_minutes: row.get::<_, i64>(2).unwrap_or_default() as u32,
-            used_percent_tenths: row.get::<_, i64>(3).unwrap_or_default() as u16,
-            resets_at: row.get::<_, Option<i64>>(4).unwrap_or_default().and_then(instant),
-            observed_at: instant(row.get::<_, i64>(5).unwrap_or_default()).unwrap_or_else(Utc::now),
-        }))
+        Ok(SourceApp::from_str(&source)
+            .ok()
+            .map(|source_app| UsageQuota {
+                source_app,
+                label: (!label.is_empty()).then_some(label),
+                window_minutes: row.get::<_, i64>(2).unwrap_or_default() as u32,
+                used_percent_tenths: row.get::<_, i64>(3).unwrap_or_default() as u16,
+                resets_at: row
+                    .get::<_, Option<i64>>(4)
+                    .unwrap_or_default()
+                    .and_then(instant),
+                observed_at: instant(row.get::<_, i64>(5).unwrap_or_default())
+                    .unwrap_or_else(Utc::now),
+            }))
     })?;
     Ok(rows.filter_map(|row| row.ok().flatten()).collect())
 }
@@ -544,25 +683,26 @@ fn read_health(connection: &Connection) -> Result<Vec<SourceSyncHealth>, rusqlit
     let rows = statement.query_map([], |row| {
         let source: String = row.get(0)?;
         let state: String = row.get(1)?;
-        Ok(
-            SourceApp::from_str(&source)
-                .ok()
-                .map(|source_app| SourceSyncHealth {
-                    source_app,
-                    state: state_from_name(&state),
-                    app_synced_at: row.get::<_, Option<i64>>(2).unwrap_or_default().and_then(instant),
-                    source_observed_at: row
-                        .get::<_, Option<i64>>(3)
-                        .unwrap_or_default()
-                        .and_then(instant),
-                    last_attempt_at: row
-                        .get::<_, Option<i64>>(4)
-                        .unwrap_or_default()
-                        .and_then(instant),
-                    last_error: row.get::<_, Option<String>>(5).unwrap_or_default(),
-                    awaiting_upstream: row.get::<_, i64>(6).unwrap_or_default() != 0,
-                }),
-        )
+        Ok(SourceApp::from_str(&source)
+            .ok()
+            .map(|source_app| SourceSyncHealth {
+                source_app,
+                state: state_from_name(&state),
+                app_synced_at: row
+                    .get::<_, Option<i64>>(2)
+                    .unwrap_or_default()
+                    .and_then(instant),
+                source_observed_at: row
+                    .get::<_, Option<i64>>(3)
+                    .unwrap_or_default()
+                    .and_then(instant),
+                last_attempt_at: row
+                    .get::<_, Option<i64>>(4)
+                    .unwrap_or_default()
+                    .and_then(instant),
+                last_error: row.get::<_, Option<String>>(5).unwrap_or_default(),
+                awaiting_upstream: row.get::<_, i64>(6).unwrap_or_default() != 0,
+            }))
     })?;
     Ok(rows.filter_map(|row| row.ok().flatten()).collect())
 }
@@ -678,7 +818,9 @@ mod tests {
     fn an_interim_snapshot_is_replaced_by_its_final_one() {
         let repository = store();
         repository.commit(usage(vec![record("e1", 1, 5)])).unwrap();
-        let settled = repository.commit(usage(vec![record("e1", 1, 120)])).unwrap();
+        let settled = repository
+            .commit(usage(vec![record("e1", 1, 120)]))
+            .unwrap();
 
         assert_eq!(settled.counts.updated, 1);
         assert_eq!(repository.count().unwrap(), 1);
@@ -836,6 +978,158 @@ mod tests {
     }
 
     #[test]
+    fn quota_samples_are_written_only_when_the_value_moves() {
+        let repository = store();
+        let quota = |used: u16, observed: i64| UsageQuota {
+            source_app: SourceApp::ClaudeCode,
+            label: None,
+            window_minutes: 300,
+            used_percent_tenths: used,
+            resets_at: Some(Utc.timestamp_opt(10_000, 0).unwrap()),
+            observed_at: Utc.timestamp_opt(observed, 0).unwrap(),
+        };
+        let commit = |snapshot: UsageQuota| {
+            repository
+                .commit(SourceTransaction {
+                    quotas: vec![snapshot],
+                    ..SourceTransaction::new(SourceApp::ClaudeCode, "claude", Utc::now())
+                })
+                .unwrap();
+        };
+
+        commit(quota(100, 1_000));
+        commit(quota(100, 1_100)); // same value, fresher read: no new sample
+        commit(quota(150, 1_200)); // value moved: a new sample
+        commit(quota(150, 1_300)); // same again: no new sample
+
+        let samples = repository
+            .quota_samples(Utc.timestamp_opt(0, 0).unwrap())
+            .unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].used_percent_tenths, 100);
+        assert_eq!(samples[1].used_percent_tenths, 150);
+    }
+
+    #[test]
+    fn prune_quota_samples_drops_only_old_rows() {
+        let repository = store();
+        let quota = |used: u16, observed: i64| UsageQuota {
+            source_app: SourceApp::ClaudeCode,
+            label: None,
+            window_minutes: 300,
+            used_percent_tenths: used,
+            resets_at: Some(Utc.timestamp_opt(1_000_000, 0).unwrap()),
+            observed_at: Utc.timestamp_opt(observed, 0).unwrap(),
+        };
+        // Two samples: one old, one recent.
+        for snapshot in [quota(100, 1_000), quota(200, 800_000)] {
+            repository
+                .commit(SourceTransaction {
+                    quotas: vec![snapshot],
+                    ..SourceTransaction::new(SourceApp::ClaudeCode, "claude", Utc::now())
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            repository
+                .quota_samples(Utc.timestamp_opt(0, 0).unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let pruned = repository
+            .prune_quota_samples(Utc.timestamp_opt(500_000, 0).unwrap())
+            .unwrap();
+        assert_eq!(pruned, 1);
+        let remaining = repository
+            .quota_samples(Utc.timestamp_opt(0, 0).unwrap())
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].used_percent_tenths, 200);
+    }
+
+    #[test]
+    fn a_version_one_store_upgrades_to_quota_samples() {
+        // Open a fresh store (base schema is version 1 shape), drop the
+        // sample table and stamp version 1, then reopen: the migration runner
+        // must recreate the table and bump the version without losing data.
+        let directory = std::env::temp_dir().join(format!("tokens-mig-{}", std::process::id()));
+        let path = directory.join("usage.sqlite3");
+        let _ = std::fs::remove_dir_all(&directory);
+
+        {
+            let repository = SqliteUsageRepository::open(&path).unwrap();
+            repository
+                .with_connection(|connection| {
+                    connection.execute_batch(
+                        "DROP TABLE quota_samples;
+                         UPDATE meta SET value = '1' WHERE key = 'schema_version';",
+                    )
+                })
+                .unwrap();
+            repository.commit(usage(vec![record("e1", 1, 10)])).unwrap();
+        }
+
+        let reopened = SqliteUsageRepository::open(&path).unwrap();
+        // The store still reads, and the sample table exists again.
+        assert_eq!(reopened.count().unwrap(), 1);
+        let samples = reopened
+            .quota_samples(Utc.timestamp_opt(0, 0).unwrap())
+            .unwrap();
+        assert_eq!(samples.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_recent_burst_turns_the_snapshot_pace_red() {
+        let repository = store();
+        let reset = Utc::now() + chrono::Duration::minutes(60);
+        // Seed a gentle window-open average: 100 tenths consumed over 4
+        // elapsed hours — well green.
+        let seed = UsageQuota {
+            source_app: SourceApp::ClaudeCode,
+            label: None,
+            window_minutes: 300,
+            used_percent_tenths: 100,
+            resets_at: Some(reset),
+            observed_at: Utc::now() - chrono::Duration::minutes(30),
+        };
+        repository
+            .commit(SourceTransaction {
+                quotas: vec![seed.clone()],
+                ..SourceTransaction::new(SourceApp::ClaudeCode, "claude", Utc::now())
+            })
+            .unwrap();
+
+        // Then the whole of the last 30 minutes is consumed in a burst.
+        let burst = UsageQuota {
+            used_percent_tenths: 500,
+            observed_at: Utc::now(),
+            ..seed.clone()
+        };
+        repository
+            .commit(SourceTransaction {
+                quotas: vec![burst],
+                ..SourceTransaction::new(SourceApp::ClaudeCode, "claude", Utc::now())
+            })
+            .unwrap();
+
+        let snapshot = repository
+            .snapshot(&SummaryQuery::default(), &RecentQuery::default())
+            .unwrap();
+        let pace = snapshot
+            .pace
+            .iter()
+            .find(|each| each.source_app == SourceApp::ClaudeCode)
+            .expect("the live quota yields a pace row");
+        // Trailing: 500 remaining * 30 / 400 = 37 min vs T = 60 → red.
+        assert_eq!(pace.state, crate::domain::PaceState::Red);
+        assert!(pace.shortfall_minutes.unwrap() > 0);
+    }
+
+    #[test]
     fn no_conversation_content_reaches_the_store() {
         let repository = store();
         repository.commit(usage(vec![record("e1", 1, 10)])).unwrap();
@@ -854,7 +1148,10 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
             let object = value.as_object().unwrap();
             for forbidden in ["prompt", "response", "content", "text", "path"] {
-                assert!(!object.contains_key(forbidden), "stored a {forbidden} field");
+                assert!(
+                    !object.contains_key(forbidden),
+                    "stored a {forbidden} field"
+                );
             }
         }
     }

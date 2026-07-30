@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use crate::alerts::AlertLedger;
-use crate::domain::{AppOptions, UsageQuota};
+use crate::domain::{AppOptions, UsageQuota, WindowPace};
 use crate::fixtures;
 use crate::refresh::RefreshHandle;
 use crate::repository::{InMemoryUsageRepository, UsageReader};
@@ -77,6 +77,18 @@ impl AppState {
     /// and the alerts must see exactly what the dashboard sees.
     pub fn quotas(&self) -> Vec<UsageQuota> {
         self.reader.quotas().unwrap_or_default()
+    }
+
+    /// The pace of every live window, computed the same way the dashboard
+    /// computes it. Alerts need it to warn on projected exhaustion, and it
+    /// must come from the same inputs the interface sees or the banner and
+    /// the notification would disagree.
+    ///
+    /// Reads risk and nothing else. This runs on every refresh tick and every
+    /// notification action, so it must not drag two summaries, a count and a
+    /// record list along behind it.
+    pub fn pace(&self) -> Vec<WindowPace> {
+        self.reader.pace().unwrap_or_default()
     }
 
     pub fn options(&self) -> AppOptions {

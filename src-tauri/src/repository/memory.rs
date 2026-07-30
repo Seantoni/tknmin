@@ -8,17 +8,18 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    RecentQuery, RepositoryRevision, SourceApp, SourceCheckpoint, SourceSyncHealth, SummaryQuery,
-    UsageQuota, UsageRecord, UsageSummary,
+    QuotaSample, RecentQuery, RepositoryRevision, SourceApp, SourceCheckpoint, SourceSyncHealth,
+    SummaryQuery, UsageQuota, UsageRecord, UsageSummary, WindowPace,
 };
 
 use super::summarize;
 use super::{
-    apply_health, assemble_snapshot, materially_differs, merge_quota, quota_key, CommitCounts, CommitOutcome,
-    DashboardSnapshot, RepositoryError, SourceTransaction, UsageReader, UsageWriter,
+    apply_health, assemble_pace_only, assemble_snapshot, materially_differs, merge_quota,
+    quota_key, CommitCounts, CommitOutcome, DashboardSnapshot, RepositoryError, SourceTransaction,
+    UsageReader, UsageWriter,
 };
 
 #[derive(Debug, Default)]
@@ -27,6 +28,7 @@ struct Store {
     /// the first one created rather than beside it.
     records: HashMap<String, UsageRecord>,
     quotas: Vec<UsageQuota>,
+    quota_samples: Vec<QuotaSample>,
     health: Vec<SourceSyncHealth>,
     checkpoints: HashMap<(String, String), SourceCheckpoint>,
     revision: RepositoryRevision,
@@ -79,12 +81,38 @@ impl UsageReader for InMemoryUsageRepository {
         Ok(summarize::take_recent(matching, query))
     }
 
+    fn records_since(&self, since: DateTime<Utc>) -> Result<Vec<UsageRecord>, RepositoryError> {
+        Ok(self
+            .read()?
+            .records
+            .values()
+            .filter(|record| {
+                record
+                    .event_timestamp_utc
+                    .is_some_and(|event| event >= since)
+            })
+            .cloned()
+            .collect())
+    }
+
     fn count(&self) -> Result<usize, RepositoryError> {
         Ok(self.read()?.records.len())
     }
 
     fn quotas(&self) -> Result<Vec<UsageQuota>, RepositoryError> {
         Ok(self.read()?.quotas.clone())
+    }
+
+    fn quota_samples(&self, since: DateTime<Utc>) -> Result<Vec<QuotaSample>, RepositoryError> {
+        let mut samples: Vec<QuotaSample> = self
+            .read()?
+            .quota_samples
+            .iter()
+            .filter(|sample| sample.observed_at >= since)
+            .cloned()
+            .collect();
+        samples.sort_by_key(|sample| sample.observed_at);
+        Ok(samples)
     }
 
     fn health(&self) -> Result<Vec<SourceSyncHealth>, RepositoryError> {
@@ -111,6 +139,10 @@ impl UsageReader for InMemoryUsageRepository {
         recent: &RecentQuery,
     ) -> Result<DashboardSnapshot, RepositoryError> {
         assemble_snapshot(self, overview, recent)
+    }
+
+    fn pace(&self) -> Result<Vec<WindowPace>, RepositoryError> {
+        assemble_pace_only(self)
     }
 }
 
@@ -176,7 +208,36 @@ impl UsageWriter for InMemoryUsageRepository {
             quotas_changed |= store.quotas.len() != before;
         }
         for quota in transaction.quotas {
-            quotas_changed |= merge_quota(&mut store.quotas, quota);
+            let incoming = quota.clone();
+            if merge_quota(&mut store.quotas, quota) {
+                quotas_changed = true;
+                // Sample for pace history, on the same change-only rule the
+                // SQLite backend uses, so the two stay checkable against each
+                // other.
+                let moved = store
+                    .quota_samples
+                    .iter()
+                    .rev()
+                    .find(|sample| {
+                        sample.source_app == incoming.source_app
+                            && sample.label == incoming.label
+                            && sample.window_minutes == incoming.window_minutes
+                    })
+                    .is_none_or(|sample| {
+                        sample.used_percent_tenths != incoming.used_percent_tenths
+                            || sample.resets_at != incoming.resets_at
+                    });
+                if moved {
+                    store.quota_samples.push(QuotaSample {
+                        source_app: incoming.source_app,
+                        label: incoming.label,
+                        window_minutes: incoming.window_minutes,
+                        used_percent_tenths: incoming.used_percent_tenths,
+                        resets_at: incoming.resets_at,
+                        observed_at: incoming.observed_at,
+                    });
+                }
+            }
         }
 
         for checkpoint in transaction.checkpoints {
@@ -216,6 +277,18 @@ impl UsageWriter for InMemoryUsageRepository {
             data_changed,
         })
     }
+
+    fn prune_quota_samples(&self, before: DateTime<Utc>) -> Result<usize, RepositoryError> {
+        let mut store = self
+            .store
+            .write()
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let held = store.quota_samples.len();
+        store
+            .quota_samples
+            .retain(|sample| sample.observed_at >= before);
+        Ok(held - store.quota_samples.len())
+    }
 }
 
 #[cfg(test)]
@@ -246,7 +319,8 @@ mod tests {
                 ..TokenCounts::default()
             });
         draft.model = model.map(str::to_string);
-        normalize::normalize_at(draft, Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).unwrap()).unwrap()
+        normalize::normalize_at(draft, Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).unwrap())
+            .unwrap()
     }
 
     fn instant(day: u32) -> DateTime<Utc> {
@@ -268,10 +342,20 @@ mod tests {
     fn replaying_identical_content_is_a_no_op() {
         let repository = InMemoryUsageRepository::new();
         let first = repository
-            .commit(usage(vec![record(SourceApp::Cursor, 1, Some("m"), Some(5))]))
+            .commit(usage(vec![record(
+                SourceApp::Cursor,
+                1,
+                Some("m"),
+                Some(5),
+            )]))
             .unwrap();
         let second = repository
-            .commit(usage(vec![record(SourceApp::Cursor, 1, Some("m"), Some(5))]))
+            .commit(usage(vec![record(
+                SourceApp::Cursor,
+                1,
+                Some("m"),
+                Some(5),
+            )]))
             .unwrap();
 
         assert_eq!(first.counts.inserted, 1);
@@ -334,7 +418,12 @@ mod tests {
     fn a_failed_attempt_preserves_the_data_it_had() {
         let repository = InMemoryUsageRepository::new();
         repository
-            .commit(usage(vec![record(SourceApp::Cursor, 1, Some("m"), Some(5))]))
+            .commit(usage(vec![record(
+                SourceApp::Cursor,
+                1,
+                Some("m"),
+                Some(5),
+            )]))
             .unwrap();
 
         let outcome = repository
@@ -564,6 +653,116 @@ mod tests {
             .unwrap();
         assert_eq!(usd.amount, Money::new(200, "USD", 2).unwrap());
         assert_eq!(usd.counted_records, 2);
+    }
+
+    /// A record of `tokens` input at an exact instant, for history tests.
+    fn burned(source: SourceApp, at: DateTime<Utc>, tokens: u64) -> UsageRecord {
+        let draft = UsageRecordDraft::new(source, provenance())
+            .with_raw_timestamp(at.to_rfc3339())
+            .with_tokens(TokenCounts {
+                input: TokenField::exact(tokens),
+                output: TokenField::exact(0),
+                ..TokenCounts::default()
+            });
+        normalize::normalize_at(draft, at).unwrap()
+    }
+
+    #[test]
+    fn risk_reads_history_the_dashboard_filter_cannot_hide() {
+        // The baseline and the current burn must not depend on what the
+        // dashboard happens to be showing: a filter is a way of looking at the
+        // data, not a change to how much allowance is left.
+        let now = Utc::now();
+        // The rate is measured over the trailing hour, so it is judged against
+        // the hour that window mostly covers — the one 30 minutes back.
+        let burn_at = now - chrono::Duration::minutes(30);
+
+        let mut records = Vec::new();
+        for day_back in 1..=5 {
+            records.push(burned(
+                SourceApp::Codex,
+                burn_at - chrono::Duration::days(day_back),
+                10_000,
+            ));
+        }
+        // Today's burn, at exactly the usual rate for this hour.
+        records.push(burned(SourceApp::Codex, burn_at, 10_000));
+        // Sixty newer records from another source — more than the recent
+        // list's default limit, so a baseline drawn from that list would see
+        // none of the history above.
+        for n in 0..60u64 {
+            records.push(burned(
+                SourceApp::Cursor,
+                now - chrono::Duration::seconds(n as i64),
+                n + 1,
+            ));
+        }
+
+        let repository = InMemoryUsageRepository::with_records(records);
+        repository
+            .commit(SourceTransaction {
+                quotas: vec![UsageQuota {
+                    source_app: SourceApp::Codex,
+                    label: None,
+                    window_minutes: 300,
+                    used_percent_tenths: 500,
+                    resets_at: Some(now + chrono::Duration::hours(2)),
+                    observed_at: now,
+                }],
+                ..SourceTransaction::new(SourceApp::Codex, "test", now)
+            })
+            .unwrap();
+
+        let codex_verdict = |recent: &RecentQuery| {
+            repository
+                .snapshot(&SummaryQuery::default(), recent)
+                .unwrap()
+                .pace
+                .into_iter()
+                .find(|pace| pace.source_app == SourceApp::Codex)
+                .expect("the live Codex window has a pace row")
+                .vs_baseline
+        };
+
+        assert_eq!(
+            codex_verdict(&RecentQuery::default()),
+            crate::domain::PaceVsBaseline::Typical,
+            "a burn at the usual rate for this hour read as something else"
+        );
+        // Looking at another source, one row at a time, changes nothing.
+        assert_eq!(
+            codex_verdict(&RecentQuery {
+                limit: 1,
+                filter: SummaryQuery {
+                    sources: Some(vec![SourceApp::ClaudeCode]),
+                    ..SummaryQuery::default()
+                },
+            }),
+            crate::domain::PaceVsBaseline::Typical,
+        );
+    }
+
+    #[test]
+    fn records_since_ignores_limits_and_filters() {
+        let now = Utc::now();
+        let mut records = vec![burned(
+            SourceApp::Codex,
+            now - chrono::Duration::days(45),
+            1_000,
+        )];
+        for n in 0..100u64 {
+            records.push(burned(
+                SourceApp::Cursor,
+                now - chrono::Duration::minutes(n as i64),
+                n + 1,
+            ));
+        }
+        let repository = InMemoryUsageRepository::with_records(records);
+
+        let since = repository
+            .records_since(now - chrono::Duration::days(30))
+            .unwrap();
+        assert_eq!(since.len(), 100, "the cutoff is the only thing that bounds");
     }
 
     #[test]

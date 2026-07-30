@@ -8,7 +8,10 @@
 import type { SourceApp } from "./usage";
 
 /** What a per-source threshold measures. */
-export type ThresholdMetric = "remaining_percent" | "minutes_until_reset";
+export type ThresholdMetric =
+  | "remaining_percent"
+  | "minutes_until_reset"
+  | "projected_exhaustion";
 
 export interface SourceThreshold {
   sourceApp: SourceApp;
@@ -27,11 +30,13 @@ export interface AppOptions {
 export const THRESHOLD_METRICS: readonly ThresholdMetric[] = [
   "remaining_percent",
   "minutes_until_reset",
+  "projected_exhaustion",
 ];
 
 export const DEFAULT_THRESHOLD_VALUE: Record<ThresholdMetric, number> = {
   remaining_percent: 25,
   minutes_until_reset: 60,
+  projected_exhaustion: 60,
 };
 
 export function defaultOptions(): AppOptions {
@@ -53,6 +58,8 @@ export function metricLabel(metric: ThresholdMetric): string {
       return "percent left";
     case "minutes_until_reset":
       return "minutes until reset";
+    case "projected_exhaustion":
+      return "runs out early";
   }
 }
 

@@ -1058,6 +1058,27 @@ button.strip-row:hover {
   white-space: nowrap;
 }
 
+.mini-pace {
+  font-size: 10px;
+  color: var(--dim);
+}
+
+/* Words carry the state; colour is only redundancy. Red gets the text colour
+   so it reads as a statement, amber stays dim, and every other state keeps
+   the quiet register the rest of the panel uses. */
+.mini-pace.is-red,
+.quota.is-red .quota-pace {
+  color: var(--text);
+}
+
+.mini-pace-basis {
+  color: var(--faint);
+}
+
+.quota-pace {
+  color: var(--muted);
+}
+
 .mini-bar {
   display: block;
   height: 2px;

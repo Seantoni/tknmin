@@ -435,6 +435,11 @@ impl Scheduler {
             if now >= next_full_reconcile {
                 next_full_reconcile = now + self.policy.full_reconcile;
                 self.enqueue_all(SyncMode::Reconcile, RefreshCategory::Usage, Duration::ZERO);
+                // Quota samples exist only to measure a trailing pace. Once
+                // they are older than the longest horizon in use they are
+                // weight, so the idle path drops them.
+                let cutoff = Utc::now() - chrono::Duration::days(7);
+                let _ = self.writer.prune_quota_samples(cutoff);
             }
             if now >= next_quota {
                 next_quota = now + self.policy.quota_interval;

@@ -17,8 +17,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    RecentQuery, ReplaceScope, RepositoryRevision, SourceApp, SourceCheckpoint, SourceSyncHealth,
-    SummaryQuery, UsageQuota, UsageRecord, UsageSummary,
+    build_baseline, evaluate_pace, recent_token_rates, QuotaSample, RecentQuery, ReplaceScope,
+    RepositoryRevision, SourceApp, SourceBaseline, SourceCheckpoint, SourceSyncHealth,
+    SummaryQuery, UsageQuota, UsageRecord, UsageSummary, WindowPace, BASELINE_DAYS,
+    RATE_WINDOW_MINUTES,
 };
 
 pub use memory::InMemoryUsageRepository;
@@ -175,6 +177,10 @@ pub struct DashboardSnapshot {
     pub record_count: usize,
     pub quotas: Vec<UsageQuota>,
     pub health: Vec<SourceSyncHealth>,
+    /// One pace row per live allowance window, computed from the quotas in
+    /// this same snapshot so a projection can never sit beside a quota from a
+    /// different revision than the one that produced it.
+    pub pace: Vec<WindowPace>,
 }
 
 /// Read-only access. Everything but the coordinator gets this.
@@ -182,6 +188,18 @@ pub trait UsageReader: Send + Sync {
     fn summary(&self, query: &SummaryQuery) -> Result<UsageSummary, RepositoryError>;
 
     fn recent(&self, query: &RecentQuery) -> Result<Vec<UsageRecord>, RepositoryError>;
+
+    /// Every record at or after `since`, unfiltered and uncapped.
+    ///
+    /// Deliberately not [`UsageReader::recent`]. That one serves a list the
+    /// user is looking at: it honours the dashboard's filter and stops at a few
+    /// dozen rows. Risk must do neither. A baseline drawn through the active
+    /// filter would make the projection change when the user clicks a source
+    /// chip, and one drawn from the newest 50 records is not a month of history
+    /// — it is a few minutes of it, which is also the wrong direction for a
+    /// current burn, since capping the newest rows undercounts the busiest
+    /// hours by exactly as much as they are busy.
+    fn records_since(&self, since: DateTime<Utc>) -> Result<Vec<UsageRecord>, RepositoryError>;
 
     fn count(&self) -> Result<usize, RepositoryError>;
 
@@ -193,12 +211,26 @@ pub trait UsageReader: Send + Sync {
 
     fn checkpoints(&self, adapter_id: &str) -> Result<Vec<SourceCheckpoint>, RepositoryError>;
 
+    /// Historical quota observations at or after `since`, oldest first, for
+    /// pace measurement. Returns nothing until the sample-capturing schema is
+    /// in place; until then every pace falls back to its window-open rung.
+    fn quota_samples(&self, _since: DateTime<Utc>) -> Result<Vec<QuotaSample>, RepositoryError> {
+        Ok(Vec::new())
+    }
+
     /// One consistent read of everything a window renders.
     fn snapshot(
         &self,
         overview: &SummaryQuery,
         recent: &RecentQuery,
     ) -> Result<DashboardSnapshot, RepositoryError>;
+
+    /// Just the pace of every live window, for callers that need risk and
+    /// nothing else — the alert lane runs this on every refresh tick and every
+    /// notification action, and assembling a whole dashboard to read one field
+    /// would put two summaries, a count and a record list on that path. Same
+    /// inputs as the snapshot's, so the banner and the notification agree.
+    fn pace(&self) -> Result<Vec<WindowPace>, RepositoryError>;
 }
 
 /// Mutating access. Held by `crate::refresh` and nothing else in production.
@@ -207,6 +239,13 @@ pub trait UsageWriter: UsageReader {
     ///
     /// Failure changes neither data nor revision.
     fn commit(&self, transaction: SourceTransaction) -> Result<CommitOutcome, RepositoryError>;
+
+    /// Drop quota samples older than `before`. They exist only to measure a
+    /// trailing pace, so once they fall outside every horizon in use they are
+    /// weight. Called on the idle path, not on the commit path.
+    fn prune_quota_samples(&self, _before: DateTime<Utc>) -> Result<usize, RepositoryError> {
+        Ok(0)
+    }
 }
 
 /// Default snapshot assembly, shared by the backends.
@@ -215,15 +254,76 @@ pub(crate) fn assemble_snapshot(
     overview_query: &SummaryQuery,
     recent_query: &RecentQuery,
 ) -> Result<DashboardSnapshot, RepositoryError> {
+    // Read the revision before any payload. If a commit lands during the
+    // remaining reads, the snapshot carries the older revision and the
+    // already-subscribed interface will refetch for the newer event. Reading
+    // it later could stamp old quota/pace data with the new revision and make
+    // the interface discard the one event that would repair it.
+    // One instant for the whole assembly. Reading the clock again per
+    // measurement would let a slow read date the burn, the baseline and the
+    // projection differently, which is the same inconsistency the revision
+    // rule above exists to prevent.
+    let now = Utc::now();
+    let revision = reader.revision()?;
+    let quotas = reader.quotas()?;
+    let pace = assemble_pace(reader, &quotas, now)?;
     Ok(DashboardSnapshot {
-        revision: reader.revision()?,
+        revision,
         overview: reader.summary(overview_query)?,
         summary: reader.summary(&recent_query.filter)?,
         recent: reader.recent(recent_query)?,
         record_count: reader.count()?,
-        quotas: reader.quotas()?,
+        quotas,
         health: reader.health()?,
+        pace,
     })
+}
+
+/// How far back samples are kept for pace measurement: the longest window in
+/// use is a monthly billing cycle, plus margin.
+const SAMPLE_HORIZON_DAYS: i64 = 62;
+
+/// Every live window's pace, from quotas already read at this revision.
+///
+/// Shared by the snapshot and the pace-only path so the dashboard, the banner
+/// and the OS notification cannot disagree about the same window.
+pub(crate) fn assemble_pace(
+    reader: &dyn UsageReader,
+    quotas: &[UsageQuota],
+    now: DateTime<Utc>,
+) -> Result<Vec<WindowPace>, RepositoryError> {
+    // Until a backend stores samples this is empty and every pace rests on its
+    // window-open rung alone.
+    let samples = reader.quota_samples(now - chrono::Duration::days(SAMPLE_HORIZON_DAYS))?;
+    // History for the baseline and the current burn: unfiltered and uncapped,
+    // so neither depends on what the dashboard happens to be showing.
+    let history = reader.records_since(now - chrono::Duration::days(i64::from(BASELINE_DAYS)))?;
+    // The local timezone is unknown to a pure domain, so the offset is taken
+    // from the host here at the boundary, in minutes because not every zone is
+    // a whole hour from UTC. DST drift of an hour smears a slot boundary but
+    // does not invert the pattern.
+    let tz_offset_minutes = i64::from(chrono::Local::now().offset().local_minus_utc()) / 60;
+    let baselines: Vec<SourceBaseline> = SourceApp::ALL
+        .iter()
+        .map(|source| build_baseline(*source, &history, tz_offset_minutes, now))
+        .collect();
+    let recent_rates = recent_token_rates(&history, RATE_WINDOW_MINUTES, now);
+    Ok(evaluate_pace(
+        quotas,
+        &samples,
+        &baselines,
+        &recent_rates,
+        tz_offset_minutes,
+        now,
+    ))
+}
+
+/// The pace-only read path: quotas plus [`assemble_pace`].
+pub(crate) fn assemble_pace_only(
+    reader: &dyn UsageReader,
+) -> Result<Vec<WindowPace>, RepositoryError> {
+    let quotas = reader.quotas()?;
+    assemble_pace(reader, &quotas, Utc::now())
 }
 
 /// The key a quota snapshot merges on: source, pool, window length.
@@ -231,11 +331,7 @@ pub(crate) fn assemble_snapshot(
 /// A source can meter several windows at once and they are not
 /// interchangeable, so all three parts matter.
 pub(crate) fn quota_key(quota: &UsageQuota) -> (SourceApp, Option<String>, u32) {
-    (
-        quota.source_app,
-        quota.label.clone(),
-        quota.window_minutes,
-    )
+    (quota.source_app, quota.label.clone(), quota.window_minutes)
 }
 
 /// Merge one incoming quota snapshot into a stored set.
@@ -316,6 +412,7 @@ mod tests {
     use super::*;
     use crate::domain::SyncState;
     use chrono::TimeZone;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn quota(window: u32, used: u16, observed: i64) -> UsageQuota {
         UsageQuota {
@@ -391,5 +488,93 @@ mod tests {
         assert!(transaction.records.is_empty());
         assert!(transaction.quotas.is_empty());
         assert!(!transaction.replace_quotas);
+    }
+
+    struct RevisionFirstReader {
+        inner: InMemoryUsageRepository,
+        revision_read: AtomicBool,
+    }
+
+    impl RevisionFirstReader {
+        fn assert_revision_was_read(&self) {
+            assert!(
+                self.revision_read.load(Ordering::SeqCst),
+                "snapshot payload was read before its revision"
+            );
+        }
+    }
+
+    impl UsageReader for RevisionFirstReader {
+        fn summary(&self, query: &SummaryQuery) -> Result<UsageSummary, RepositoryError> {
+            self.assert_revision_was_read();
+            self.inner.summary(query)
+        }
+
+        fn recent(&self, query: &RecentQuery) -> Result<Vec<UsageRecord>, RepositoryError> {
+            self.assert_revision_was_read();
+            self.inner.recent(query)
+        }
+
+        fn records_since(
+            &self,
+            since: DateTime<Utc>,
+        ) -> Result<Vec<UsageRecord>, RepositoryError> {
+            self.assert_revision_was_read();
+            self.inner.records_since(since)
+        }
+
+        fn count(&self) -> Result<usize, RepositoryError> {
+            self.assert_revision_was_read();
+            self.inner.count()
+        }
+
+        fn quotas(&self) -> Result<Vec<UsageQuota>, RepositoryError> {
+            self.assert_revision_was_read();
+            self.inner.quotas()
+        }
+
+        fn health(&self) -> Result<Vec<SourceSyncHealth>, RepositoryError> {
+            self.assert_revision_was_read();
+            self.inner.health()
+        }
+
+        fn revision(&self) -> Result<RepositoryRevision, RepositoryError> {
+            self.revision_read.store(true, Ordering::SeqCst);
+            self.inner.revision()
+        }
+
+        fn checkpoints(&self, adapter_id: &str) -> Result<Vec<SourceCheckpoint>, RepositoryError> {
+            self.assert_revision_was_read();
+            self.inner.checkpoints(adapter_id)
+        }
+
+        fn quota_samples(&self, since: DateTime<Utc>) -> Result<Vec<QuotaSample>, RepositoryError> {
+            self.assert_revision_was_read();
+            self.inner.quota_samples(since)
+        }
+
+        fn snapshot(
+            &self,
+            overview: &SummaryQuery,
+            recent: &RecentQuery,
+        ) -> Result<DashboardSnapshot, RepositoryError> {
+            assemble_snapshot(self, overview, recent)
+        }
+
+        fn pace(&self) -> Result<Vec<WindowPace>, RepositoryError> {
+            assemble_pace_only(self)
+        }
+    }
+
+    #[test]
+    fn snapshot_reads_revision_before_any_payload() {
+        let reader = RevisionFirstReader {
+            inner: InMemoryUsageRepository::new(),
+            revision_read: AtomicBool::new(false),
+        };
+
+        reader
+            .snapshot(&SummaryQuery::default(), &RecentQuery::default())
+            .unwrap();
     }
 }

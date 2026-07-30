@@ -16,12 +16,17 @@ pub enum ThresholdMetric {
     RemainingPercent,
     /// Warn when the window resets within this many minutes.
     MinutesUntilReset,
+    /// Warn when the measured pace projects the allowance to run out at least
+    /// this many minutes before the window resets. Position-blind: a window
+    /// can sit at 60% and still be projected to exhaust.
+    ProjectedExhaustion,
 }
 
 impl ThresholdMetric {
-    pub const ALL: [ThresholdMetric; 2] = [
+    pub const ALL: [ThresholdMetric; 3] = [
         ThresholdMetric::RemainingPercent,
         ThresholdMetric::MinutesUntilReset,
+        ThresholdMetric::ProjectedExhaustion,
     ];
 }
 
@@ -134,6 +139,11 @@ impl AppOptions {
                 ThresholdMetric::MinutesUntilReset if threshold.value > 10_080 => {
                     return Err(OptionsError::Invalid(
                         "minutes-until-reset threshold must be at most one week".into(),
+                    ));
+                }
+                ThresholdMetric::ProjectedExhaustion if threshold.value > 10_080 => {
+                    return Err(OptionsError::Invalid(
+                        "projected-exhaustion threshold must be at most one week".into(),
                     ));
                 }
                 _ => {}

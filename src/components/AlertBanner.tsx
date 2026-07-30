@@ -13,6 +13,20 @@ type AlertBannerProps = {
   handoffCopiedKey: string | null;
 };
 
+/** The crossed line, as the banner says it. Exhaustive on the metric. */
+function alertHeadline(alert: ThresholdAlert): string {
+  switch (alert.metric) {
+    case "remaining_percent":
+      return `${formatPercentTenths(alert.remainingPercentTenths)} left`;
+    case "minutes_until_reset":
+      return `resets in ${alert.minutesUntilReset} min`;
+    case "projected_exhaustion":
+      return alert.shortfallMinutes === null
+        ? "projected to run out early"
+        : `projected to run out ${alert.shortfallMinutes} min early`;
+  }
+}
+
 export function AlertBanner({
   alerts,
   onContinue,
@@ -29,10 +43,7 @@ export function AlertBanner({
             <span className="dot" style={{ background: SOURCE_COLOR[alert.sourceApp] }} />
             <div className="alert-copy">
               <p className="alert-title">
-                {SOURCE_LABEL[alert.sourceApp]} ·{" "}
-                {alert.metric === "remaining_percent"
-                  ? `${formatPercentTenths(alert.remainingPercentTenths)} left`
-                  : `resets in ${alert.minutesUntilReset} min`}{" "}
+                {SOURCE_LABEL[alert.sourceApp]} · {alertHeadline(alert)}{" "}
                 {describeQuotaWindow(alert.windowMinutes)}
               </p>
               <p className="alert-meta">

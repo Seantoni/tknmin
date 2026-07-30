@@ -14,14 +14,80 @@ import { useOptions } from "./hooks/useOptions";
 import { useThresholdAlerts } from "./hooks/useThresholdAlerts";
 import type { AppOptions } from "./domain/options";
 import {
+  describePaceState,
   describeQuotaWindow,
   describeQuotaWindows,
   formatPercentTenths,
   quotaRemainingTenths,
-  tightestQuotaPerSource,
 } from "./format";
 import { SOURCE_LABEL } from "./theme";
 import { showMiniWindow } from "./api/window";
+import { useNow } from "./hooks/useNow";
+import type { WindowPace } from "./domain/pace";
+import type { SourceApp, UsageQuota } from "./domain/usage";
+
+/** The pace row matching one quota window, when one was computed. */
+function paceFor(paces: WindowPace[], quota: UsageQuota): WindowPace | undefined {
+  return paces.find(
+    (each) =>
+      each.sourceApp === quota.sourceApp &&
+      each.windowMinutes === quota.windowMinutes &&
+      each.label === quota.label,
+  );
+}
+
+function pacePriority(pace: WindowPace | undefined): number {
+  if (pace === undefined) return 6;
+  switch (pace.state) {
+    case "exhausted":
+      return 0;
+    case "red":
+      return 1;
+    case "amber":
+      return 2;
+    case "unknown":
+      return 3;
+    case "green":
+      return 4;
+    case "notStarted":
+      return 5;
+  }
+}
+
+/**
+ * One quota per source for the header, chosen by projected risk first.
+ *
+ * Remaining percentage alone can hide the binding window: a green week with
+ * 10% left must not suppress a red session with 40% left.
+ */
+function headerQuotaPerSource(quotas: UsageQuota[], paces: WindowPace[]): UsageQuota[] {
+  const chosen = new Map<SourceApp, UsageQuota>();
+  for (const candidate of quotas) {
+    const held = chosen.get(candidate.sourceApp);
+    if (held === undefined) {
+      chosen.set(candidate.sourceApp, candidate);
+      continue;
+    }
+
+    const candidatePace = paceFor(paces, candidate);
+    const heldPace = paceFor(paces, held);
+    const candidatePriority = pacePriority(candidatePace);
+    const heldPriority = pacePriority(heldPace);
+    const candidateRunway = candidatePace?.runwayMinutes ?? Number.MAX_SAFE_INTEGER;
+    const heldRunway = heldPace?.runwayMinutes ?? Number.MAX_SAFE_INTEGER;
+
+    if (
+      candidatePriority < heldPriority ||
+      (candidatePriority === heldPriority && candidateRunway < heldRunway) ||
+      (candidatePriority === heldPriority &&
+        candidateRunway === heldRunway &&
+        quotaRemainingTenths(candidate) < quotaRemainingTenths(held))
+    ) {
+      chosen.set(candidate.sourceApp, candidate);
+    }
+  }
+  return [...chosen.values()];
+}
 
 type Screen = "dashboard" | "settings";
 
@@ -48,6 +114,7 @@ function App() {
     update: updateOptions,
   } = useOptions();
   const { alerts, handoffCopiedKey, continueAlert, createHandoff } = useThresholdAlerts();
+  const now = useNow();
 
   const onOptionsChange = (next: AppOptions) => {
     void updateOptions(next);
@@ -59,19 +126,26 @@ function App() {
         <div className="brand">
           <h1>tokens</h1>
           {screen === "dashboard" &&
-            tightestQuotaPerSource(snapshot?.quotas ?? []).map((quota) => (
-              <span
-                key={quota.sourceApp}
-                className="quota"
-                title={describeQuotaWindows(
-                  (snapshot?.quotas ?? []).filter((each) => each.sourceApp === quota.sourceApp),
-                )}
-              >
-                {SOURCE_LABEL[quota.sourceApp]} ·{" "}
-                {formatPercentTenths(quotaRemainingTenths(quota))} left{" "}
-                {describeQuotaWindow(quota.windowMinutes)}
-              </span>
-            ))}
+            headerQuotaPerSource(snapshot?.quotas ?? [], snapshot?.pace ?? []).map((quota) => {
+              const pace = paceFor(snapshot?.pace ?? [], quota);
+              return (
+                <span
+                  key={quota.sourceApp}
+                  className={`quota${pace !== undefined && (pace.state === "red" || pace.state === "amber") ? ` is-${pace.state}` : ""}`}
+                  title={describeQuotaWindows(
+                    (snapshot?.quotas ?? []).filter((each) => each.sourceApp === quota.sourceApp),
+                  )}
+                >
+                  {SOURCE_LABEL[quota.sourceApp]} ·{" "}
+                  {formatPercentTenths(quotaRemainingTenths(quota))} left{" "}
+                  {describeQuotaWindow(quota.windowMinutes)}
+                  {pace !== undefined &&
+                    (pace.state === "red" || pace.state === "amber") && (
+                      <span className="quota-pace"> · {describePaceState(pace, now)}</span>
+                    )}
+                </span>
+              );
+            })}
         </div>
         <div className="top-right">
           {screen === "dashboard" && (

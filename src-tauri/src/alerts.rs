@@ -11,7 +11,10 @@ use chrono::Utc;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
-use crate::domain::{evaluate_alerts, AppOptions, ThresholdAlert, UsageQuota, HANDOFF_PROMPT};
+use crate::domain::{
+    evaluate_alerts, live_alert_keys, AppOptions, ThresholdAlert, UsageQuota, WindowPace,
+    HANDOFF_PROMPT,
+};
 use crate::error::{AppError, ErrorCode};
 use crate::state::AppState;
 
@@ -67,8 +70,13 @@ impl AlertLedger {
             .unwrap_or(false)
     }
 
-    /// Drop ledger entries that no longer correspond to a crossing threshold
-    /// (window reset, or usage recovered above the line).
+    /// Drop ledger entries whose window instance is gone — the reset happened,
+    /// so the key that identified it can never come back.
+    ///
+    /// Scoped to the instance, not to whether the threshold is crossing this
+    /// second: a projected-exhaustion crossing comes and goes with the burn,
+    /// and dropping a snooze during a lull would let the same notification
+    /// fire again minutes later.
     pub fn prune_to(&self, retain: &HashSet<String>) {
         if let Ok(mut fired) = self.fired.lock() {
             fired.retain(|key| retain.contains(key));
@@ -86,25 +94,25 @@ pub fn evaluate_and_notify<R: Runtime>(app: &AppHandle<R>) {
     };
     let options = state.options();
     let quotas = state.quotas();
-    evaluate_and_notify_with(app, &options, &quotas, state.alerts());
+    let pace = state.pace();
+    evaluate_and_notify_with(app, &options, &quotas, &pace, state.alerts());
 }
 
 pub fn evaluate_and_notify_with<R: Runtime>(
     app: &AppHandle<R>,
     options: &AppOptions,
     quotas: &[UsageQuota],
+    pace: &[WindowPace],
     ledger: &AlertLedger,
 ) {
     let now = Utc::now();
 
-    // Keys that would fire if nothing were snoozed — used to prune stale ledger rows.
-    let open_keys: HashSet<String> = evaluate_alerts(options, quotas, now, &HashSet::new())
-        .into_iter()
-        .map(|alert| alert.dedupe_key)
-        .collect();
-    ledger.prune_to(&open_keys);
+    // Forget only what reset. A key is retained while its window instance is
+    // live, whether or not it is crossing right now, so a snooze survives the
+    // pace dipping below the line and back.
+    ledger.prune_to(&live_alert_keys(options, quotas, now));
 
-    let active = evaluate_alerts(options, quotas, now, &ledger.snoozed_keys());
+    let active = evaluate_alerts(options, quotas, pace, now, &ledger.snoozed_keys());
 
     for alert in &active {
         if ledger.has_fired(&alert.dedupe_key) {
@@ -134,9 +142,10 @@ pub fn evaluate_and_notify_with<R: Runtime>(
 pub fn active_alerts(
     options: &AppOptions,
     quotas: &[UsageQuota],
+    pace: &[WindowPace],
     ledger: &AlertLedger,
 ) -> Vec<ThresholdAlert> {
-    evaluate_alerts(options, quotas, Utc::now(), &ledger.snoozed_keys())
+    evaluate_alerts(options, quotas, pace, Utc::now(), &ledger.snoozed_keys())
 }
 
 /// Ask macOS for notification permission (or confirm it is already granted).
@@ -239,4 +248,83 @@ fn show_alert_notification<R: Runtime>(
 /// was the one on screen.
 fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     crate::mini::show_dashboard(app);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{SourceApp, SourceThreshold, ThresholdMetric};
+    use chrono::{DateTime, TimeZone};
+
+    fn options() -> AppOptions {
+        AppOptions {
+            thresholds: SourceApp::ALL
+                .into_iter()
+                .map(|source_app| SourceThreshold {
+                    source_app,
+                    enabled: true,
+                    metric: ThresholdMetric::ProjectedExhaustion,
+                    value: 30,
+                })
+                .collect(),
+            ..AppOptions::defaults()
+        }
+    }
+
+    fn quota(resets_at: DateTime<Utc>) -> UsageQuota {
+        UsageQuota {
+            source_app: SourceApp::ClaudeCode,
+            label: None,
+            window_minutes: 300,
+            used_percent_tenths: 600,
+            resets_at: Some(resets_at),
+            observed_at: resets_at - chrono::Duration::hours(2),
+        }
+    }
+
+    #[test]
+    fn a_snooze_survives_the_pace_dipping_below_the_line() {
+        // The user clicks Continue on a projected-exhaustion alert, then
+        // pauses. The pace stops crossing, so no alert is open — but the
+        // window has not reset, and the snooze must still be there when the
+        // burst returns.
+        let now = Utc.with_ymd_and_hms(2026, 7, 30, 12, 0, 0).unwrap();
+        let quotas = vec![quota(now + chrono::Duration::hours(2))];
+        let options = options();
+        let ledger = AlertLedger::new();
+
+        let key = live_alert_keys(&options, &quotas, now)
+            .into_iter()
+            .next()
+            .expect("one live window, one enabled threshold");
+        ledger.snooze(key.clone());
+
+        // The lull: nothing is crossing, and the ledger is pruned anyway.
+        ledger.prune_to(&live_alert_keys(&options, &quotas, now));
+        assert!(
+            ledger.snoozed_keys().contains(&key),
+            "a snooze was discarded while its window was still running"
+        );
+        assert!(ledger.has_fired(&key), "the alert would notify a second time");
+    }
+
+    #[test]
+    fn a_reset_clears_the_snooze() {
+        // The other half of the contract: once the window resets, its key can
+        // never come back, and Continue must not silence the next window too.
+        let now = Utc.with_ymd_and_hms(2026, 7, 30, 12, 0, 0).unwrap();
+        let options = options();
+        let before = vec![quota(now + chrono::Duration::hours(2))];
+        let ledger = AlertLedger::new();
+        let key = live_alert_keys(&options, &before, now)
+            .into_iter()
+            .next()
+            .expect("one live window, one enabled threshold");
+        ledger.snooze(key.clone());
+
+        let after = vec![quota(now + chrono::Duration::hours(7))];
+        ledger.prune_to(&live_alert_keys(&options, &after, now));
+        assert!(ledger.snoozed_keys().is_empty());
+        assert!(!ledger.has_fired(&key));
+    }
 }

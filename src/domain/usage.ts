@@ -239,6 +239,12 @@ export interface DashboardSnapshot {
   recordCount: number;
   quotas: UsageQuota[];
   health: SourceSyncHealth[];
+  /**
+   * One pace row per live allowance window, computed from the quotas in this
+   * same snapshot so a projection never sits beside a quota from a different
+   * revision than the one that produced it.
+   */
+  pace: import("./pace").WindowPace[];
 }
 
 /**

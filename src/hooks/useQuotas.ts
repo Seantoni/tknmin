@@ -17,12 +17,14 @@ import { listen } from "@tauri-apps/api/event";
 
 import { DATA_CHANGED, fetchDashboardSnapshot, toAppError } from "../api/usage";
 import type { AppError, DataChanged, SourceSyncHealth, UsageQuota } from "../domain/usage";
+import type { WindowPace } from "../domain/pace";
 
 export type QuotasStatus = "loading" | "ready" | "error";
 
 export interface Quotas {
   status: QuotasStatus;
   quotas: UsageQuota[];
+  pace: WindowPace[];
   health: SourceSyncHealth[];
   error: AppError | null;
 }
@@ -30,6 +32,7 @@ export interface Quotas {
 export function useQuotas(): Quotas {
   const [status, setStatus] = useState<QuotasStatus>("loading");
   const [quotas, setQuotas] = useState<UsageQuota[]>([]);
+  const [pace, setPace] = useState<WindowPace[]>([]);
   const [health, setHealth] = useState<SourceSyncHealth[]>([]);
   const [error, setError] = useState<AppError | null>(null);
 
@@ -45,6 +48,7 @@ export function useQuotas(): Quotas {
       if (!isMounted.current) return;
       revision.current = snapshot.revision;
       setQuotas(snapshot.quotas);
+      setPace(snapshot.pace);
       setHealth(snapshot.health);
       setStatus("ready");
       setError(null);
@@ -86,5 +90,5 @@ export function useQuotas(): Quotas {
     };
   }, []);
 
-  return { status, quotas, health, error };
+  return { status, quotas, pace, health, error };
 }

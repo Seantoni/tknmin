@@ -19,6 +19,7 @@ import type {
   UsageQuota,
   UsageRecord,
 } from "./domain/usage";
+import type { WindowPace } from "./domain/pace";
 
 /** Shown wherever a source reported nothing. */
 export const UNKNOWN = "—";
@@ -440,4 +441,93 @@ export function describeTotalRule(rule: TotalRule): string {
 
 export function orUnknown(value: string | null): string {
   return value === null || value === "" ? UNKNOWN : value;
+}
+
+/* ------------------------------------------------------------------ */
+/* Pace                                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A length of usage time in the coarsest unit that still answers the
+ * question: "25m", "1h 40m", "2d 3h". `null` is unmeasured, never zero.
+ */
+export function formatRunway(minutes: number | null): string {
+  if (minutes === null) return UNKNOWN;
+  if (minutes < 1) return "<1m";
+  if (minutes < 60) return `${Math.round(minutes)}m`;
+  const hours = Math.floor(minutes / 60);
+  const rest = Math.round(minutes % 60);
+  if (hours < 24) {
+    return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`;
+  }
+  const days = Math.floor(hours / 24);
+  const restHours = hours % 24;
+  return restHours === 0 ? `${days}d` : `${days}d ${restHours}h`;
+}
+
+/** Minutes between now and a future instant, never negative. */
+export function minutesUntil(isoInstant: string | null, now: Date = new Date()): number | null {
+  if (isoInstant === null) return null;
+  const ms = new Date(isoInstant).getTime() - now.getTime();
+  if (!Number.isFinite(ms)) return null;
+  return Math.max(0, Math.round(ms / 60_000));
+}
+
+/**
+ * The one-line pace verdict, as the interface says it. Exhaustive on purpose:
+ * a new state variant must fail `tsc` here rather than render blank.
+ */
+export function describePaceState(pace: WindowPace, now: Date = new Date()): string {
+  const runway = formatRunway(pace.runwayMinutes);
+  switch (pace.state) {
+    case "notStarted":
+      return "allowance untouched";
+    case "green":
+      return pace.runwayMinutes === null
+        ? "nothing being spent"
+        : `${runway} of usage left · comfortably inside the window`;
+    case "amber":
+      return `${runway} of usage left · right at the edge of the window`;
+    case "red": {
+      void now;
+      const shortfall = formatRunway(pace.shortfallMinutes);
+      return `runs out ${shortfall} early at this pace`;
+    }
+    case "exhausted":
+      return "allowance used up";
+    case "unknown":
+      return "too early to say";
+  }
+}
+
+/**
+ * How the current burn compares to this source's own history at this hour, as
+ * a short qualifier. `noBaseline` and `typical` say nothing — only a departure
+ * from the user's own normal is worth the space.
+ */
+export function describeVsBaseline(pace: WindowPace): string | null {
+  switch (pace.vsBaseline) {
+    case "above":
+      return "heavier than your usual right now";
+    case "farAbove":
+      return "far heavier than your usual right now";
+    case "below":
+      return "lighter than your usual right now";
+    case "typical":
+    case "noBaseline":
+      return null;
+  }
+}
+
+/** How the pace was measured, so a weak projection says so. */
+export function describePaceBasis(pace: WindowPace): string | null {
+  if (pace.basis === null) return null;
+  switch (pace.basis.kind) {
+    case "trailing":
+      return `measured over the last ${pace.basis.minutes}m`;
+    case "sinceWindowOpen":
+      return pace.basis.assumedAnchored
+        ? "averaged since the window opened"
+        : "averaged since the window opened (a rolling window can only be safer)";
+  }
 }

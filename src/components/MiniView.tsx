@@ -19,6 +19,9 @@ import { useEffect, useRef } from "react";
 
 import { fitMiniWindowHeight, showDashboardWindow } from "../api/window";
 import {
+  describePaceBasis,
+  describePaceState,
+  describeVsBaseline,
   describeQuotaResetCompact,
   describeSourceFreshness,
   describeQuotaWindows,
@@ -29,13 +32,26 @@ import {
   quotaWindowTag,
 } from "../format";
 import { useQuotas } from "../hooks/useQuotas";
+import { useNow } from "../hooks/useNow";
 import { SOURCE_COLOR, SOURCE_LABEL } from "../theme";
 import type { SourceApp, UsageQuota } from "../domain/usage";
+import type { WindowPace } from "../domain/pace";
+
+/** The pace row matching one quota window, when one was computed. */
+function paceFor(paces: WindowPace[], quota: UsageQuota): WindowPace | undefined {
+  return paces.find(
+    (each) =>
+      each.sourceApp === quota.sourceApp &&
+      each.windowMinutes === quota.windowMinutes &&
+      each.label === quota.label,
+  );
+}
 
 export function MiniView() {
-  const { status, quotas, health, error } = useQuotas();
+  const { status, quotas, pace, health, error } = useQuotas();
   const groups = quotaGroups(quotas);
   const panel = useRef<HTMLDivElement>(null);
+  const now = useNow();
 
   // Follow the panel's own height rather than recomputing it here: a wrapped
   // label or a source that starts reporting a second pool changes it too.
@@ -92,6 +108,8 @@ export function MiniView() {
                 <Window
                   quota={windows[0]}
                   quotas={quotas}
+                  pace={paceFor(pace, windows[0])}
+                  now={now}
                   name={SOURCE_LABEL[sourceApp]}
                   withDot
                 />
@@ -104,7 +122,13 @@ export function MiniView() {
                   <ul className="mini-pools">
                     {windows.map((quota) => (
                       <li key={quotaRowKey(quota)}>
-                        <Window quota={quota} quotas={quotas} name={poolName(quota, sourceApp)} />
+                        <Window
+                          quota={quota}
+                          quotas={quotas}
+                          pace={paceFor(pace, quota)}
+                          now={now}
+                          name={poolName(quota, sourceApp)}
+                        />
                       </li>
                     ))}
                   </ul>
@@ -135,15 +159,21 @@ export function MiniView() {
 function Window({
   quota,
   quotas,
+  pace,
+  now,
   name,
   withDot = false,
 }: {
   quota: UsageQuota;
   quotas: UsageQuota[];
+  pace: WindowPace | undefined;
+  now: Date;
   name: string;
   withDot?: boolean;
 }) {
   const tag = quotaWindowTag(quota.windowMinutes);
+  const basis = pace !== undefined ? describePaceBasis(pace) : null;
+  const vsBaseline = pace !== undefined ? describeVsBaseline(pace) : null;
   return (
     <div
       className="mini-row"
@@ -161,6 +191,13 @@ function Window({
         <span className="mini-used">{formatPercentTenths(quota.usedPercentTenths)} used</span>
         <span className="num mini-reset">{describeQuotaResetCompact(quota.resetsAt)}</span>
       </span>
+      {pace !== undefined && (
+        <span className={`mini-line mini-pace is-${pace.state}`}>
+          {describePaceState(pace, now)}
+          {vsBaseline !== null && <span className="mini-pace-basis"> · {vsBaseline}</span>}
+          {basis !== null && <span className="mini-pace-basis"> · {basis}</span>}
+        </span>
+      )}
       <span className="mini-bar">
         <span
           className="mini-bar-fill"

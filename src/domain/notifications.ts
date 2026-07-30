@@ -16,5 +16,8 @@ export interface ThresholdAlert {
   minutesUntilReset: number;
   resetsAt: string;
   observedAt: string;
+  /** Minutes the pace projects the allowance to run out before reset. Only
+   * set for `projected_exhaustion` alerts. */
+  shortfallMinutes: number | null;
   dedupeKey: string;
 }

@@ -186,7 +186,12 @@ pub fn disconnect_cursor_dashboard(
 /// Active threshold alerts (non-snoozed crossings), against committed quotas.
 #[tauri::command]
 pub fn active_alerts(state: State<'_, AppState>) -> Vec<ThresholdAlert> {
-    crate::alerts::active_alerts(&state.options(), &state.quotas(), state.alerts())
+    crate::alerts::active_alerts(
+        &state.options(),
+        &state.quotas(),
+        &state.pace(),
+        state.alerts(),
+    )
 }
 
 /// Snooze an alert until its window resets (Continue).
@@ -204,6 +209,7 @@ pub fn snooze_alert(
     Ok(crate::alerts::active_alerts(
         &state.options(),
         &state.quotas(),
+        &state.pace(),
         state.alerts(),
     ))
 }
