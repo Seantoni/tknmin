@@ -45,6 +45,11 @@ pub fn install<R: Runtime>(app: &AppHandle<R>, always_on_top: bool) -> tauri::Re
         // Rounded corners are the reason for transparency: the panel is drawn
         // in the document, and the window has to let its corners show through.
         .transparent(true)
+        // This window is parked beside an editor, so it is unfocused almost by
+        // definition. Without click-through, the first press is spent
+        // activating the window and never reaches the drag region — the
+        // window could only be moved on the second press.
+        .accept_first_mouse(true)
         .always_on_top(always_on_top)
         // Without this the window stays behind on the Space it was opened in,
         // which defeats the point as soon as the editor is on another one.
