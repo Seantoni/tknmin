@@ -97,4 +97,9 @@ export interface WindowPace {
   vsBaseline: PaceVsBaseline;
   /** The reading this rests on, so its age can be shown beside it. */
   observedAt: string;
+  /** Whether the reading behind this is older than the window would normally
+   * tolerate. Still measured from — the records show nothing was spent since,
+   * so an old reading is an exact one — but said out loud, because a stale
+   * reading can only ever be optimistic. */
+  fromAgedReading: boolean;
 }

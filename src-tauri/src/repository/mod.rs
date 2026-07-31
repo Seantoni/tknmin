@@ -446,9 +446,19 @@ pub(crate) fn apply_health(
         } => {
             health.state = SyncState::Current;
             health.app_synced_at = Some(at);
-            // A source that reports no observation time of its own is only as
-            // fresh as the read that found it.
-            health.source_observed_at = source_observed_at.or(Some(at));
+            // The two clocks answer different questions and must not be
+            // conflated: `app_synced_at` is when we last looked, and this is
+            // when the source last spoke. A sync that finds nothing new moves
+            // the first and must leave the second where it was — Codex writes
+            // its rate limits only while it runs, so between sessions every
+            // poll would otherwise re-date a day-old allowance to "just now"
+            // and the tooltip would vouch for a number nothing had confirmed.
+            //
+            // Only a source that has never given an observation time falls
+            // back to the read, so a first sync still has something to show.
+            health.source_observed_at = source_observed_at
+                .or(health.source_observed_at)
+                .or(Some(at));
             health.last_error = None;
             health.awaiting_upstream = *awaiting_upstream;
         }
@@ -528,6 +538,58 @@ mod tests {
         assert_eq!(health.state, SyncState::Offline);
         assert_eq!(health.app_synced_at, synced);
         assert_eq!(health.last_error.as_deref(), Some("no network"));
+    }
+
+    #[test]
+    fn a_sync_that_finds_nothing_new_does_not_re_date_the_source() {
+        // Codex writes its rate limits into a rollout file only while it runs,
+        // so between sessions every poll succeeds and carries no observation.
+        // Dating those to the read would have the tooltip vouch for a day-old
+        // allowance as if the source had just restated it.
+        let now = Utc.timestamp_opt(5_000, 0).unwrap();
+        let observed = Utc.timestamp_opt(4_000, 0).unwrap();
+        let mut health = SourceSyncHealth::unknown(SourceApp::Codex);
+        apply_health(
+            &mut health,
+            &HealthOutcome::Succeeded {
+                source_observed_at: Some(observed),
+                awaiting_upstream: false,
+            },
+            now,
+        );
+
+        let later = Utc.timestamp_opt(90_000, 0).unwrap();
+        apply_health(
+            &mut health,
+            &HealthOutcome::Succeeded {
+                source_observed_at: None,
+                awaiting_upstream: false,
+            },
+            later,
+        );
+
+        assert_eq!(health.state, SyncState::Current);
+        assert_eq!(health.app_synced_at, Some(later), "we did look just now");
+        assert_eq!(
+            health.source_observed_at,
+            Some(observed),
+            "but the source has not spoken since"
+        );
+    }
+
+    #[test]
+    fn a_source_that_has_never_reported_is_dated_by_the_read_that_found_it() {
+        let now = Utc.timestamp_opt(5_000, 0).unwrap();
+        let mut health = SourceSyncHealth::unknown(SourceApp::Codex);
+        apply_health(
+            &mut health,
+            &HealthOutcome::Succeeded {
+                source_observed_at: None,
+                awaiting_upstream: false,
+            },
+            now,
+        );
+        assert_eq!(health.source_observed_at, Some(now));
     }
 
     #[test]

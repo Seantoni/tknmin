@@ -219,7 +219,6 @@ impl SourceAdapter for CodexAdapter {
         // Codex stamps its allowance onto every token event, so the appended
         // bytes already answered the quota question. Falling back to the
         // wider scan only when nothing was appended keeps the fast path free.
-        delta.source_observed_at = freshest_quota.as_ref().map(|quota| quota.observed_at);
         match freshest_quota {
             Some(quota) => {
                 delta.quotas = vec![quota];
@@ -231,6 +230,11 @@ impl SourceAdapter for CodexAdapter {
             }
             None => {}
         }
+        // Whatever reading ended up in the delta dates the source, whichever
+        // path produced it. Read after the match, not before, or a reconcile
+        // that had to scan for the quota would report no observation time and
+        // be dated by the wall clock instead.
+        delta.source_observed_at = delta.quotas.iter().map(|quota| quota.observed_at).max();
 
         Ok(delta)
     }

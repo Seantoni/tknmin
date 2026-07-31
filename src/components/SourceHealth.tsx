@@ -22,9 +22,15 @@ interface SourceHealthProps {
   health: SourceSyncHealth[];
   /** Static facts, used to explain an offline state rather than call it a bug. */
   sources: AdapterInfo[];
+  /**
+   * Ticking clock. Ages are otherwise frozen at the last snapshot — and a
+   * quiet minute does not publish one — so "app synced just now" would stick
+   * until the next poll landed.
+   */
+  now: Date;
 }
 
-export function SourceHealthRow({ health, sources }: SourceHealthProps) {
+export function SourceHealthRow({ health, sources, now }: SourceHealthProps) {
   if (health.length === 0) return null;
 
   const ordered = [...health].sort((left, right) =>
@@ -40,14 +46,16 @@ export function SourceHealthRow({ health, sources }: SourceHealthProps) {
           <li
             key={source.sourceApp}
             className={`health-row is-${source.state}${source.awaitingUpstream ? " is-waiting" : ""}`}
-            title={describeSourceFreshness(source)}
+            title={describeSourceFreshness(source, now)}
           >
             <span className="dot" style={{ background: SOURCE_COLOR[source.sourceApp] }} />
             <span className="health-name">{SOURCE_LABEL[source.sourceApp]}</span>
             <span className="health-state">{describeSyncState(source)}</span>
-            <span className="num health-age">app synced {formatAge(source.appSyncedAt)}</span>
             <span className="num health-age">
-              source reported {formatAge(source.sourceObservedAt)}
+              app synced {formatAge(source.appSyncedAt, now)}
+            </span>
+            <span className="num health-age">
+              source reported {formatAge(source.sourceObservedAt, now)}
             </span>
             {/* The message, never the exception: adapters strip tokens and
                 paths before the error ever reaches a committed health row. */}

@@ -435,11 +435,14 @@ export function describeSyncState(health: SourceSyncHealth): string {
  * so "app synced 5s ago" and "source reported 3h ago" are both true and only
  * the pair of them is honest.
  */
-export function describeSourceFreshness(health: SourceSyncHealth): string {
+export function describeSourceFreshness(
+  health: SourceSyncHealth,
+  now: Date = new Date(),
+): string {
   const lines = [
     `${describeSyncState(health)}`,
-    `app synced ${formatAge(health.appSyncedAt)}`,
-    `source reported ${formatAge(health.sourceObservedAt)}`,
+    `app synced ${formatAge(health.appSyncedAt, now)}`,
+    `source reported ${formatAge(health.sourceObservedAt, now)}`,
   ];
   if (health.awaitingUpstream) {
     lines.push("activity detected; awaiting billing data");
@@ -686,7 +689,27 @@ export function describePaceDetail(pace: WindowPace, now: Date = new Date()): st
   if (baseline !== null) lines.push(baseline);
   const basis = describePaceBasis(pace);
   if (basis !== null) lines.push(basis);
+  const age = describePaceReadingAge(pace, now);
+  if (age !== null) lines.push(age);
   return lines.join("\n");
+}
+
+/**
+ * Said only when the reading behind the verdict is older than the window would
+ * normally tolerate — Codex publishes its allowance only while it runs, so
+ * between sessions this is the ordinary case rather than a fault.
+ *
+ * The verdict is still worth showing: the records agree nothing has been spent
+ * since, so an old reading is an exact one. But if that ever stops being true
+ * the error runs one way — an unrecorded burn leaves less than the number
+ * says — so the direction is named rather than left to be guessed.
+ */
+export function describePaceReadingAge(
+  pace: WindowPace,
+  now: Date = new Date(),
+): string | null {
+  if (!pace.fromAgedReading) return null;
+  return `from a reading ${formatAge(pace.observedAt, now)}; nothing spent since, so it can only be optimistic`;
 }
 
 /**

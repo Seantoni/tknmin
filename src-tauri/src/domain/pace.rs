@@ -120,6 +120,11 @@ pub struct WindowPace {
     pub vs_baseline: PaceVsBaseline,
     /// The reading this rests on, so its age can be shown beside it.
     pub observed_at: DateTime<Utc>,
+    /// Whether the reading behind this is older than the window would normally
+    /// tolerate. It is still measured from — the records show nothing was spent
+    /// since, so an old reading is an exact one — but the interface says so,
+    /// because a stale reading can only ever be optimistic.
+    pub from_aged_reading: bool,
 }
 
 /// One historical observation of one allowance window.
@@ -226,6 +231,7 @@ fn evaluate_window(
         basis: None,
         vs_baseline: PaceVsBaseline::NoBaseline,
         observed_at: quota.observed_at,
+        from_aged_reading: false,
     };
 
     let baseline = baselines
@@ -266,30 +272,52 @@ fn evaluate_window(
 
     let t_minutes = minutes_until(resets_at, now);
     let age_minutes = age_in_minutes(quota.observed_at, now);
-    if age_minutes > staleness_limit(quota.window_minutes) {
+    let aged = age_minutes > staleness_limit(quota.window_minutes);
+    if aged {
         // A stale percentage overstates what remains only when the source kept
         // spending after the reading. Token throughput over the last hour is
-        // independent evidence: no burn means the reading is still the truth
-        // and the honest state is idle, not "too old to say." A non-zero burn
-        // with a stale meter is the failure mode — we are behind on the
-        // allowance itself — and that stays Unknown.
+        // independent evidence, and it separates two quite different cases.
+        //
+        // A burn against a stale meter is the failure: we are behind on the
+        // allowance itself, the percentage understates what is gone, and
+        // nothing may be projected from it.
+        //
+        // No burn is the ordinary case, and it is not "nothing to say" — it is
+        // that nothing was spent since the reading, so the reading is still
+        // *exactly* true and everything derived below still holds. Which
+        // matters most for the sources whose readings age by design: Codex
+        // writes its rate limits into a rollout file only while it runs, so
+        // between sessions its meter is always hours old however close to
+        // running out it is. Cursor polls an endpoint every minute and is
+        // never aged at all, so treating age as silence would have said
+        // nothing about exactly the source that needed saying.
         let still_burning = recent_rates
             .iter()
             .find(|rate| rate.source_app == quota.source_app)
             .is_some_and(|rate| rate.tokens_per_hour > 0);
-        pace.state = if still_burning {
-            PaceState::Unknown
-        } else {
-            PaceState::Green
-        };
-        return pace;
+        if still_burning {
+            pace.state = PaceState::Unknown;
+            return pace;
+        }
     }
 
-    let Some(measurement) = best_runway(quota, samples, t_minutes, duty_cycle_percent) else {
+    // Trailing horizons difference two observations, so they need a fresh
+    // right-hand endpoint and an aged reading cannot supply one. The window's
+    // own opening needs no endpoint at all — only `resets_at`, the window's
+    // length and the percentage — so it survives the age intact.
+    let measured = if aged {
+        window_open_runway(quota)
+    } else {
+        best_runway(quota, samples, duty_cycle_percent)
+    };
+    let Some(measurement) = measured else {
         // Only an exact zero is honest Green. A small non-zero value may have
         // been discarded by the quantisation floor, so calling that idle
-        // would turn a fast first burst into "nothing being spent".
-        pace.state = if quota.used_percent_tenths == 0 {
+        // would turn a fast first burst into "nothing being spent". An aged
+        // reading is the exception: reaching here means the records show no
+        // burn at all this past hour, which is the direct evidence the
+        // quantisation floor was standing in for.
+        pace.state = if quota.used_percent_tenths == 0 || aged {
             PaceState::Green
         } else {
             PaceState::Unknown
@@ -299,6 +327,11 @@ fn evaluate_window(
 
     pace.runway_minutes = Some(measurement.runway_minutes);
     pace.basis = Some(measurement.basis);
+    // Qualifies a figure, so it is set only where there is a figure to qualify:
+    // the states above carry no runway and need no caveat about how one was
+    // reached. `tolerance` below already widens with the same age, so the
+    // verdict drawn from an old reading is the harder one to move.
+    pace.from_aged_reading = aged;
 
     let tolerance = (t_minutes / 10).max(age_minutes).max(MIN_TOLERANCE_MINUTES);
     pace.state = if measurement.runway_minutes > t_minutes.saturating_add(tolerance) {
@@ -333,7 +366,6 @@ struct RunwayMeasurement {
 fn best_runway(
     quota: &UsageQuota,
     samples: &[QuotaSample],
-    t_minutes: u32,
     duty_cycle_percent: Option<u32>,
 ) -> Option<RunwayMeasurement> {
     let mut best: Option<RunwayMeasurement> = None;
@@ -350,23 +382,8 @@ fn best_runway(
         }
     };
 
-    // The window opened at zero used, assumed anchored. Only meaningful while
-    // some of the window has actually elapsed and enough was spent to beat
-    // quantisation. runway = remaining * elapsed / consumed.
-    let observed_time_left = quota
-        .resets_at
-        .map(|resets_at| minutes_until(resets_at, quota.observed_at))
-        .unwrap_or(t_minutes);
-    let elapsed = u64::from(quota.window_minutes.saturating_sub(observed_time_left));
-    let consumed = u64::from(quota.used_percent_tenths);
-    if elapsed > 0 && consumed >= u64::from(QUANTIZATION_FLOOR_TENTHS) {
-        let runway = u64::from(remaining_tenths_of(quota)) * elapsed / consumed;
-        consider(
-            runway,
-            PaceBasis::SinceWindowOpen {
-                assumed_anchored: true,
-            },
-        );
+    if let Some(opening) = window_open_runway(quota) {
+        consider(u64::from(opening.runway_minutes), opening.basis);
     }
 
     let right = QuotaSample::from_quota(quota);
@@ -377,6 +394,32 @@ fn best_runway(
     }
 
     best
+}
+
+/// The runway implied by the window's own opening: it began at zero used, so
+/// `runway = remaining * elapsed / consumed`.
+///
+/// This rung stands apart from the trailing ones because it differences
+/// nothing. It reads only `resets_at`, the window's length and the percentage
+/// — three facts a reading carries however old it is — which is why an aged
+/// reading can still be measured from when the records show nothing was spent
+/// since. `None` while no part of the window has elapsed, or while too little
+/// was spent to beat the quantisation floor.
+fn window_open_runway(quota: &UsageQuota) -> Option<RunwayMeasurement> {
+    let resets_at = quota.resets_at?;
+    let time_left_then = minutes_until(resets_at, quota.observed_at);
+    let elapsed = u64::from(quota.window_minutes.saturating_sub(time_left_then));
+    let consumed = u64::from(quota.used_percent_tenths);
+    if elapsed == 0 || consumed < u64::from(QUANTIZATION_FLOOR_TENTHS) {
+        return None;
+    }
+    let runway = u64::from(remaining_tenths_of(quota)) * elapsed / consumed;
+    Some(RunwayMeasurement {
+        runway_minutes: runway.min(u64::from(u32::MAX)) as u32,
+        basis: PaceBasis::SinceWindowOpen {
+            assumed_anchored: true,
+        },
+    })
 }
 
 /// The runway measured over a trailing horizon: find the oldest sample inside
@@ -562,16 +605,79 @@ mod tests {
     }
 
     #[test]
-    fn idle_while_stale_is_green_not_unknown() {
+    fn an_aged_reading_is_still_measured_from_while_the_source_is_idle() {
         // Codex (and any local-file source) only restates its meter when it
         // spends. A day of silence ages the reading past the window's
-        // staleness limit even though the percentage is still exact — and
-        // blanking the row then hides the one fact the user can act on.
+        // staleness limit even though the percentage is still exact, and
+        // nothing derived from the window's own opening has gone stale with
+        // it: that rung differences nothing.
         let now = at(10);
+        // 50% used, 60 minutes to reset, observed 45 minutes ago — past the
+        // 30-minute limit a 5-hour window allows.
         let quota = quota(500, 60, 300, 45, now);
         let pace = pace_of(&quota, now);
         assert_eq!(pace.state, PaceState::Green);
-        assert_eq!(pace.runway_minutes, None, "idle carries no runway");
+        assert_eq!(
+            pace.runway_minutes,
+            Some(195),
+            "500 remaining * 195 elapsed / 500 consumed"
+        );
+        assert!(pace.from_aged_reading, "and the row says where it came from");
+    }
+
+    #[test]
+    fn an_aged_reading_can_still_say_a_window_runs_out_early() {
+        // The case that was silent before: the reading is a day old because
+        // the source has not run, but it plainly does not reach the reset.
+        // Codex's week, as the live store held it — 69% used, five days from
+        // opening, four and a half days still to go.
+        let now = at(1_000);
+        let quota = UsageQuota {
+            source_app: SourceApp::Codex,
+            label: None,
+            window_minutes: 10_080,
+            used_percent_tenths: 690,
+            resets_at: Some(now + Duration::minutes(6_731)),
+            // Well past staleness_limit(10080) = 1008 minutes.
+            observed_at: now - Duration::minutes(1_450),
+        };
+        let pace = pace_of(&quota, now);
+        assert_eq!(pace.state, PaceState::Red, "it runs out days early");
+        assert_eq!(
+            pace.runway_minutes,
+            Some(853),
+            "310 remaining * 1899 elapsed / 690 consumed"
+        );
+        assert_eq!(pace.shortfall_minutes, Some(5_878));
+        assert!(pace.from_aged_reading);
+    }
+
+    #[test]
+    fn an_aged_reading_stays_unmeasured_while_the_source_is_still_burning() {
+        // Age plus an active burn is the real failure: we are behind on the
+        // allowance itself, so the percentage understates what is gone and
+        // nothing may be projected from it.
+        let now = at(10);
+        let quota = quota(500, 60, 300, 45, now);
+        let pace = evaluate_pace(
+            std::slice::from_ref(&quota),
+            &[],
+            &[],
+            &burning(1_000),
+            0,
+            now,
+        )
+        .remove(0);
+        assert_eq!(pace.state, PaceState::Unknown);
+        assert_eq!(pace.runway_minutes, None);
+        assert!(!pace.from_aged_reading, "nothing was measured to qualify");
+    }
+
+    #[test]
+    fn a_fresh_reading_is_never_marked_aged() {
+        let now = at(10);
+        let quota = quota(500, 60, 300, 0, now);
+        assert!(!pace_of(&quota, now).from_aged_reading);
     }
 
     #[test]

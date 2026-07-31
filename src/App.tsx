@@ -139,8 +139,11 @@ function App() {
                   {describeQuotaWindow(quota.windowMinutes)}
                   {verdict !== null && (
                     <span className="quota-pace">
-                      {" "}
-                      · {verdict}
+                      {" · "}
+                      {/* Derived from a reading the source has not restated,
+                          marked the way every unconfirmed figure here is. */}
+                      {pace?.fromAgedReading === true && <span className="q-approx">≈</span>}
+                      {verdict}
                       {gap !== null && ` · ${gap}`}
                     </span>
                   )}
@@ -284,7 +287,7 @@ function App() {
                 </>
               )}
 
-              <SourceHealthRow health={snapshot.health} sources={sources} />
+              <SourceHealthRow health={snapshot.health} sources={sources} now={now} />
 
               <footer className="foot">
                 {snapshot.summary.undatedRecordsExcluded > 0 &&

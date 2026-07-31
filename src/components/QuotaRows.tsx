@@ -92,7 +92,7 @@ export function QuotaRows({ quotas, pace, projections, health, now, layout }: Qu
         {quotaGroups(quotas).flatMap(({ sourceApp, windows }) => {
           const sourceHealth = health.find((each) => each.sourceApp === sourceApp);
           const freshness =
-            sourceHealth === undefined ? undefined : describeSourceFreshness(sourceHealth);
+            sourceHealth === undefined ? undefined : describeSourceFreshness(sourceHealth, now);
           return windows.map((quota, index) => {
             const pool = windows.length === 1 ? null : poolName(quota, sourceApp);
             const tag = quotaWindowTag(quota.windowMinutes);
@@ -133,7 +133,9 @@ export function QuotaRows({ quotas, pace, projections, health, now, layout }: Qu
           <li
             key={sourceApp}
             className="q-group"
-            title={sourceHealth === undefined ? undefined : describeSourceFreshness(sourceHealth)}
+            title={
+              sourceHealth === undefined ? undefined : describeSourceFreshness(sourceHealth, now)
+            }
           >
             {windows.length === 1 ? (
               <Row
@@ -241,6 +243,18 @@ function Row({
 }) {
   const verdict = pace === undefined ? null : describePaceCompact(pace);
   const gap = pace === undefined ? null : describePaceGap(pace);
+  // A verdict measured from a reading the source has not restated since gets
+  // the same tilde the percentage uses, and for the same reason: the figure is
+  // derived rather than confirmed. It is still shown — the records agree
+  // nothing was spent since — but a stale reading can only read optimistically,
+  // and the tooltip says by how long.
+  const verdictNode =
+    verdict === null ? null : (
+      <span className={`q-verdict is-${pace?.state}`}>
+        {pace?.fromAgedReading === true && <span className="q-approx">≈</span>}
+        {verdict}
+      </span>
+    );
   const evenPace = quotaEvenPacePercent(quota, now);
   // The tooltip carries every window of the same source, so one row can answer
   // a question about its neighbours, plus the caveats the row leaves out —
@@ -307,7 +321,7 @@ function Row({
           {windowTag !== null && <span className="q-window">{windowTag}</span>}
           {bar}
           {left}
-          {verdict !== null && <span className={`q-verdict is-${pace?.state}`}>{verdict}</span>}
+          {verdictNode}
           {gap !== null && <span className="q-gap">· {gap}</span>}
           <span className="num q-reset">{describeQuotaResetCompact(quota.resetsAt)}</span>
         </span>
@@ -325,7 +339,7 @@ function Row({
       </span>
       {bar}
       <span className="q-line q-detail">
-        {verdict !== null && <span className={`q-verdict is-${pace?.state}`}>{verdict}</span>}
+        {verdictNode}
         {gap !== null && <span className="q-gap">· {gap}</span>}
         <span className="num q-reset">{describeQuotaResetCompact(quota.resetsAt)}</span>
       </span>

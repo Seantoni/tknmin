@@ -452,6 +452,7 @@ mod tests {
             basis: None,
             vs_baseline: crate::domain::PaceVsBaseline::NoBaseline,
             observed_at: quota.observed_at,
+            from_aged_reading: false,
         }
     }
 

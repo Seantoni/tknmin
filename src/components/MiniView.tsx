@@ -169,9 +169,9 @@ export function MiniView() {
       {status === "error" && error !== null ? (
         <p className="mini-empty">{error.message}</p>
       ) : quotas.length === 0 ? (
-        <p className="mini-empty">
-          {status === "loading" ? "reading allowances…" : "no source reports an allowance yet"}
-        </p>
+        status === "loading" ? null : (
+          <p className="mini-empty">no source reports an allowance yet</p>
+        )
       ) : (
         <QuotaRows
           quotas={quotas}
