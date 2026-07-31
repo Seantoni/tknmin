@@ -18,9 +18,9 @@ use crate::domain::{
 
 use super::summarize;
 use super::{
-    apply_health, assemble_pace_only, assemble_snapshot, materially_differs, merge_quota,
-    quota_key, CommitCounts, CommitOutcome, DashboardSnapshot, RepositoryError, SourceTransaction,
-    UsageReader, UsageWriter,
+    apply_health, assemble_pace_only, assemble_risk_snapshot, assemble_snapshot,
+    materially_differs, merge_quota, quota_key, CommitCounts, CommitOutcome, DashboardSnapshot,
+    RepositoryError, RiskSnapshot, SourceTransaction, UsageReader, UsageWriter,
 };
 
 #[derive(Debug, Default)]
@@ -155,6 +155,10 @@ impl UsageReader for InMemoryUsageRepository {
         recent: &RecentQuery,
     ) -> Result<DashboardSnapshot, RepositoryError> {
         assemble_snapshot(self, overview, recent)
+    }
+
+    fn risk_snapshot(&self) -> Result<RiskSnapshot, RepositoryError> {
+        assemble_risk_snapshot(self)
     }
 
     fn pace(&self) -> Result<Vec<WindowPace>, RepositoryError> {

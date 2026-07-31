@@ -17,8 +17,9 @@ use crate::state::AppState;
 /// Install the status item. Called once during setup.
 pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let summary = current_summary(app);
-    let quotas = current_quotas(app);
-    let paces = current_pace(app);
+    let risk = current_risk(app);
+    let quotas = sorted(risk.quotas);
+    let paces = risk.pace;
 
     let menu = build_menu(app, summary.as_ref(), &quotas)?;
 
@@ -43,34 +44,52 @@ fn current_summary<R: Runtime>(app: &AppHandle<R>) -> Option<UsageSummary> {
     state.reader().summary(&SummaryQuery::default()).ok()
 }
 
-/// Every live allowance window, ordered source by source, shortest window
-/// first — the order the menu reads in.
-fn current_quotas<R: Runtime>(app: &AppHandle<R>) -> Vec<UsageQuota> {
-    let Some(state) = app.try_state::<AppState>() else {
-        return Vec::new();
-    };
-    let mut quotas = state.quotas();
+/// Allowances and their pace, in one read at one revision.
+fn current_risk<R: Runtime>(app: &AppHandle<R>) -> crate::repository::RiskSnapshot {
+    app.try_state::<AppState>()
+        .map(|state| state.risk())
+        .unwrap_or_else(|| crate::repository::RiskSnapshot {
+            revision: 0,
+            quotas: Vec::new(),
+            health: Vec::new(),
+            pace: Vec::new(),
+            projections: Vec::new(),
+        })
+}
+
+/// Source by source, shortest window first — the order the menu reads in.
+fn sorted(mut quotas: Vec<UsageQuota>) -> Vec<UsageQuota> {
     quotas.sort_by_key(|quota| (quota.source_app, quota.window_minutes));
     quotas
 }
 
-fn current_pace<R: Runtime>(app: &AppHandle<R>) -> Vec<WindowPace> {
-    let Some(state) = app.try_state::<AppState>() else {
-        return Vec::new();
+/// Repaint the title after any committed revision — called even when no number
+/// moved, because the title is not only numbers.
+///
+/// It carries countdowns: `claude 34%·2h`, `codex 31%↓14h·5d`. Those are
+/// wrong the moment they stop counting, and a quiet stretch is exactly when
+/// nothing else would have repainted them. Formatting a handful of quotas
+/// costs nothing worth saving.
+pub fn refresh_title<R: Runtime>(app: &AppHandle<R>) {
+    let Some(tray) = app.tray_by_id("usage") else {
+        return;
     };
-    state.pace()
+    let risk = current_risk(app);
+    let quotas = sorted(risk.quotas);
+    let _ = tray.set_title(Some(&title_for(&quotas, &risk.pace, Utc::now())));
 }
 
-/// Repaint the status item after the store changed underneath it — called
-/// after every import, or the bar would keep showing the startup summary.
+/// Repaint the whole item — title and menu — after the store changed
+/// underneath it. The menu carries token totals, so this one does re-aggregate
+/// and is reserved for revisions that actually moved data.
 pub fn refresh<R: Runtime>(app: &AppHandle<R>) {
     let Some(tray) = app.tray_by_id("usage") else {
         return;
     };
     let summary = current_summary(app);
-    let quotas = current_quotas(app);
-    let paces = current_pace(app);
-    let _ = tray.set_title(Some(&title_for(&quotas, &paces, Utc::now())));
+    let risk = current_risk(app);
+    let quotas = sorted(risk.quotas);
+    let _ = tray.set_title(Some(&title_for(&quotas, &risk.pace, Utc::now())));
     if let Ok(menu) = build_menu(app, summary.as_ref(), &quotas) {
         let _ = tray.set_menu(Some(menu));
     }

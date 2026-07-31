@@ -108,6 +108,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::dashboard_snapshot,
+            commands::quota_snapshot,
             commands::usage_summary,
             commands::recent_usage,
             commands::usage_record_count,
@@ -168,13 +169,19 @@ impl RefreshObserver for TauriObserver {
         // freshness ages even when the numbers do not.
         let _ = self.app.emit(DATA_CHANGED_EVENT, event);
 
-        // The menu bar and the alerts do not. Re-aggregating every record and
-        // re-evaluating every threshold because a quota poll found the same
-        // percentage it found a minute ago is work that cannot change its own
-        // answer, and it would run all day.
         if event.data_changed {
+            // Re-aggregating every record and re-evaluating every threshold is
+            // only worth doing when a number actually moved. It would run all
+            // day otherwise, and could not change its own answer.
             menubar::refresh(&self.app);
             alerts::evaluate_and_notify(&self.app);
+        } else {
+            // The title still has to be redrawn. It carries countdowns to each
+            // reset, and a countdown that only advances when a percentage
+            // happens to move is not a countdown — on a quiet afternoon it
+            // would sit on "·2h" for hours. This repaints the string and
+            // nothing else: no aggregation, no thresholds.
+            menubar::refresh_title(&self.app);
         }
     }
 }

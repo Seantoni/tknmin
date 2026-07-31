@@ -256,6 +256,15 @@ export interface DataChanged {
   inserted: number;
   updated: number;
   deleted: number;
+  /**
+   * True when records or quotas moved, as opposed to only freshness.
+   *
+   * A quota poll that finds the same percentage it found a minute ago still
+   * advances "app synced … ago", so it still publishes — but nothing it could
+   * summarise has changed. Consumers use this to refresh the cheap half of a
+   * screen every revision and the expensive half only when it can differ.
+   */
+  dataChanged: boolean;
   appSyncedAt: string;
 }
 
@@ -265,6 +274,27 @@ export interface DataChanged {
  * Fetched as a unit precisely so a total from one revision can never appear
  * beside a quota from another.
  */
+/**
+ * The allowance half of a snapshot, read at one revision.
+ *
+ * The same four fields {@link DashboardSnapshot} carries, without the two
+ * summaries, the thread report, the record list and the count beside them.
+ *
+ * That is the whole difference, and it is worth about fifteen times the cost:
+ * against a 50,000-record store a dashboard snapshot measures ~460ms, of which
+ * this half is ~30ms — the rest is aggregation that deserialises every
+ * record's payload. A window that renders allowances only should not wait a
+ * third of a second to redraw them, least of all when the source it is
+ * watching changes every couple of seconds.
+ */
+export interface RiskSnapshot {
+  revision: number;
+  quotas: UsageQuota[];
+  health: SourceSyncHealth[];
+  pace: import("./pace").WindowPace[];
+  projections: import("./pace").QuotaProjection[];
+}
+
 export interface DashboardSnapshot {
   revision: number;
   /** Unfiltered, so proportions stay comparable while a filter is active. */

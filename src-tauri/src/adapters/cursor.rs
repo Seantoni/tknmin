@@ -42,7 +42,7 @@ use crate::domain::{
 
 use super::{
     AdapterError, DeltaRequest, DiscoveredSource, RawSourceInput, SourceAdapter, SourceDelta,
-    SourceFormat, SyncMode,
+    SourceFormat, SyncMode, WatchRoot,
 };
 
 const SOURCE_REF: &str = "global-bubbles";
@@ -488,10 +488,12 @@ impl SourceAdapter for CursorAdapter {
     /// The global-storage directory rather than `state.vscdb` itself: SQLite
     /// writes through `-wal` and `-shm` siblings and replaces files on
     /// checkpoint, so only the directory sees every form the activity takes.
-    fn watch_roots(&self) -> Vec<PathBuf> {
+    fn watch_roots(&self) -> Vec<WatchRoot> {
+        // The database, its write-ahead log and its shared-memory file all sit
+        // directly in this directory; nothing below it is Cursor's usage.
         self.db_path
             .parent()
-            .map(|parent| vec![parent.to_path_buf()])
+            .map(|parent| vec![WatchRoot::shallow(parent.to_path_buf())])
             .unwrap_or_default()
     }
 
@@ -2178,7 +2180,7 @@ mod tests {
         // and replaces files on checkpoint.
         assert_eq!(
             adapter.watch_roots(),
-            vec![PathBuf::from("/apps/globalStorage")]
+            vec![WatchRoot::shallow(PathBuf::from("/apps/globalStorage"))]
         );
         assert!(adapter.needs_network());
     }

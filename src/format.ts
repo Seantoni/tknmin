@@ -674,7 +674,9 @@ export function describeProjection(
       now,
     )}`,
     `+${formatPercentTenths(projection.addedPercentTenths)} estimated from usage since`,
-    `rate fitted from ${projection.pairs} readings, spread ±${projection.residualPercent}%`,
+    projection.provisional
+      ? "rate from a single reading so far, not yet corroborated"
+      : `rate fitted from ${projection.pairs} readings, typically within ±${projection.residualPercent}%`,
   ].join("\n");
 }
 

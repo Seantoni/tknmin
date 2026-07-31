@@ -17,7 +17,7 @@ use crate::alerts::AlertLedger;
 use crate::domain::{AppOptions, UsageQuota, WindowPace};
 use crate::fixtures;
 use crate::refresh::RefreshHandle;
-use crate::repository::{InMemoryUsageRepository, UsageReader};
+use crate::repository::{InMemoryUsageRepository, RiskSnapshot, UsageReader};
 
 pub struct AppState {
     reader: Arc<dyn UsageReader>,
@@ -77,6 +77,22 @@ impl AppState {
     /// and the alerts must see exactly what the dashboard sees.
     pub fn quotas(&self) -> Vec<UsageQuota> {
         self.reader.quotas().unwrap_or_default()
+    }
+
+    /// Allowances and their pace in one consistent read.
+    ///
+    /// The menu bar needs both and draws them on one line, so reading them
+    /// separately would let a commit land between the two and pair a
+    /// percentage with the pace of a different revision. It also halves the
+    /// work: the pace assembly reads the quotas anyway.
+    pub fn risk(&self) -> RiskSnapshot {
+        self.reader.risk_snapshot().unwrap_or_else(|_| RiskSnapshot {
+            revision: 0,
+            quotas: Vec::new(),
+            health: Vec::new(),
+            pace: Vec::new(),
+            projections: Vec::new(),
+        })
     }
 
     /// The pace of every live window, computed the same way the dashboard

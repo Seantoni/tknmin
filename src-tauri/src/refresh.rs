@@ -36,7 +36,6 @@
 //! would not change automatic correctness.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -44,7 +43,9 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::adapters::{self, AdapterError, DeltaRequest, SourceAdapter, SourceDelta, SyncMode};
+use crate::adapters::{
+    self, AdapterError, DeltaRequest, SourceAdapter, SourceDelta, SyncMode, WatchRoot,
+};
 use crate::domain::{RepositoryRevision, SourceApp};
 use crate::pipeline;
 use crate::repository::{CommitCounts, HealthOutcome, SourceTransaction, UsageWriter};
@@ -411,9 +412,10 @@ impl RefreshCoordinator {
         handle
     }
 
-    /// Which directory belongs to which source. Adapters name their roots;
-    /// registering them is refresh work, so it happens here.
-    fn watch_roots(&self) -> Vec<(PathBuf, SourceApp)> {
+    /// Which directory belongs to which source. Adapters name their roots and
+    /// how deeply each should be followed; registering them is refresh work, so
+    /// it happens here.
+    fn watch_roots(&self) -> Vec<(WatchRoot, SourceApp)> {
         self.adapters
             .iter()
             .flat_map(|adapter| {
@@ -1107,13 +1109,14 @@ fn log_job(
 /// a second refresh owner running on the notification thread.
 mod watch {
     use super::{Message, RefreshTrigger};
+    use crate::adapters::WatchRoot;
     use crate::domain::SourceApp;
     use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::mpsc::Sender;
 
     pub(super) fn install(
-        roots: Vec<(PathBuf, SourceApp)>,
+        roots: Vec<(WatchRoot, SourceApp)>,
         outbox: Sender<Message>,
     ) -> notify::Result<RecommendedWatcher> {
         let owners = roots.clone();
@@ -1131,9 +1134,17 @@ mod watch {
             // A root that does not exist yet is not an error: Codex creates
             // `archived_sessions/` the first time a session ends, and
             // reconciliation covers it until a watch can be placed.
-            if root.exists() {
-                let _ = watcher.watch(&root, RecursiveMode::Recursive);
+            if !root.path.exists() {
+                continue;
             }
+            // The adapter decided the depth, and for one of these roots it is
+            // the user's home directory: see `WatchRoot`.
+            let mode = if root.recursive {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+            let _ = watcher.watch(&root.path, mode);
         }
 
         Ok(watcher)
@@ -1144,39 +1155,57 @@ mod watch {
     /// The one special case is `~/.claude.json`: it lives beside the
     /// transcripts rather than under them, and a change to it is a new
     /// allowance reading rather than new usage.
-    fn classify(path: &Path, owners: &[(PathBuf, SourceApp)]) -> Option<RefreshTrigger> {
+    /// Which is also why the match below has to be this careful. Watching that
+    /// file means watching the user's home directory, so the home directory is
+    /// one of Claude Code's roots — and everything in `$HOME` not claimed by a
+    /// more specific root therefore lands on Claude Code by default. Left at
+    /// that, an unrelated `.jsonl` written anywhere in home would spend a full
+    /// transcript walk answering for a file no source has heard of.
+    fn classify(path: &Path, owners: &[(WatchRoot, SourceApp)]) -> Option<RefreshTrigger> {
         let name = path.file_name().and_then(|name| name.to_str())?;
-        let owner = owners
+        let (root, source) = owners
             .iter()
-            .filter(|(root, _)| path.starts_with(root))
+            .filter(|(root, _)| path.starts_with(&root.path))
             // The most specific root wins, so a nested watch is not shadowed
             // by the broader one that contains it.
-            .max_by_key(|(root, _)| root.as_os_str().len())?;
+            .max_by_key(|(root, _)| root.path.as_os_str().len())?;
 
         if name == ".claude.json" {
             return Some(RefreshTrigger::ClaudeQuotaCacheChanged);
         }
-        match owner.1 {
+        match source {
             SourceApp::Cursor => Some(RefreshTrigger::CursorLocalActivity),
+            // Claude Code's usage is the transcript tree and nothing else. Its
+            // other root is the home directory, watched shallowly for the one
+            // file handled above; whatever else lands there is somebody's.
+            SourceApp::ClaudeCode if !root.recursive => None,
             SourceApp::ClaudeCode if !name.ends_with(".jsonl") => None,
-            source => Some(RefreshTrigger::LocalSourceChanged(source)),
+            source => Some(RefreshTrigger::LocalSourceChanged(*source)),
         }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::path::PathBuf;
 
-        fn owners() -> Vec<(PathBuf, SourceApp)> {
+        fn owners() -> Vec<(WatchRoot, SourceApp)> {
             vec![
-                (PathBuf::from("/home/.codex/sessions"), SourceApp::Codex),
                 (
-                    PathBuf::from("/home/.claude/projects"),
+                    WatchRoot::tree(PathBuf::from("/home/.codex/sessions")),
+                    SourceApp::Codex,
+                ),
+                (
+                    WatchRoot::tree(PathBuf::from("/home/.claude/projects")),
                     SourceApp::ClaudeCode,
                 ),
-                (PathBuf::from("/home"), SourceApp::ClaudeCode),
+                // The home directory, watched shallowly for `.claude.json`.
                 (
-                    PathBuf::from("/apps/Cursor/globalStorage"),
+                    WatchRoot::shallow(PathBuf::from("/home")),
+                    SourceApp::ClaudeCode,
+                ),
+                (
+                    WatchRoot::shallow(PathBuf::from("/apps/Cursor/globalStorage")),
                     SourceApp::Cursor,
                 ),
             ]
@@ -1229,6 +1258,26 @@ mod watch {
             assert_eq!(
                 classify(Path::new("/home/.claude/projects/app/notes.md"), &owners()),
                 None
+            );
+        }
+
+        #[test]
+        fn a_transcript_shaped_file_elsewhere_in_home_is_not_claude_code() {
+            // Codex keeps several of these beside its sessions directory, and
+            // they matched the old rule on their extension alone: each one cost
+            // a walk of every Claude Code transcript to discover nothing.
+            assert_eq!(
+                classify(Path::new("/home/.codex/session_index.jsonl"), &owners()),
+                None
+            );
+            assert_eq!(classify(Path::new("/home/notes.jsonl"), &owners()), None);
+        }
+
+        #[test]
+        fn the_home_directory_is_still_watched_for_the_one_file_it_owns() {
+            assert_eq!(
+                classify(Path::new("/home/.claude.json"), &owners()),
+                Some(RefreshTrigger::ClaudeQuotaCacheChanged)
             );
         }
     }

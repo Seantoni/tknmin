@@ -18,6 +18,7 @@ import type {
   AppError,
   DashboardSnapshot,
   ErrorCode,
+  RiskSnapshot,
   RecentQuery,
   SummaryQuery,
   UsageQuota,
@@ -27,6 +28,7 @@ import type {
 
 const COMMANDS = {
   dashboardSnapshot: "dashboard_snapshot",
+  quotaSnapshot: "quota_snapshot",
   usageSummary: "usage_summary",
   recentUsage: "recent_usage",
   usageRecordCount: "usage_record_count",
@@ -61,6 +63,18 @@ export function fetchDashboardSnapshot(
     overview,
     recent: resolved,
   });
+}
+
+/**
+ * The allowance half alone, at one revision.
+ *
+ * Same contract as {@link fetchDashboardSnapshot} — one read, one revision,
+ * nothing that can interleave — but it computes only what an allowance row
+ * draws. Callers that render no totals should use this: see
+ * {@link RiskSnapshot} for what the difference costs.
+ */
+export function fetchRiskSnapshot(): Promise<RiskSnapshot> {
+  return call<RiskSnapshot>(COMMANDS.quotaSnapshot);
 }
 
 /** Totals and breakdowns for one filter. */

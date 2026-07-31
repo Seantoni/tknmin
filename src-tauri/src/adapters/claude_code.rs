@@ -33,7 +33,7 @@ use crate::domain::{
 
 use super::{
     file_identity, read_from_offset, split_complete_lines, AdapterError, DeltaRequest,
-    DiscoveredSource, RawSourceInput, SourceAdapter, SourceDelta, SyncMode,
+    DiscoveredSource, RawSourceInput, SourceAdapter, SourceDelta, SyncMode, WatchRoot,
 };
 
 const PROJECTS_DIR: &str = "projects";
@@ -138,10 +138,14 @@ impl SourceAdapter for ClaudeCodeAdapter {
     /// Claude Code replaced it: an atomic write creates a new file and renames
     /// it over the old one, and a watch on the old inode sees nothing. The
     /// directory sees the rename.
-    fn watch_roots(&self) -> Vec<PathBuf> {
-        let mut roots = vec![self.root.join(PROJECTS_DIR)];
+    fn watch_roots(&self) -> Vec<WatchRoot> {
+        // The transcripts are a tree and have to be walked as one. The config
+        // file's directory is watched shallowly and deliberately: it is the
+        // user's home, the rename lands directly in it, and nothing nested
+        // under it belongs to this source.
+        let mut roots = vec![WatchRoot::tree(self.root.join(PROJECTS_DIR))];
         if let Some(parent) = self.config_file.parent() {
-            roots.push(parent.to_path_buf());
+            roots.push(WatchRoot::shallow(parent.to_path_buf()));
         }
         roots
     }
@@ -1579,10 +1583,19 @@ mod tests {
         );
         let roots = adapter.watch_roots();
 
-        assert!(roots.contains(&PathBuf::from("/home/.claude/projects")));
-        // The parent, not the file: an atomic write replaces the inode, and a
-        // watch on the old one would go quiet forever.
-        assert!(roots.contains(&PathBuf::from("/home")));
-        assert!(!roots.contains(&PathBuf::from("/home/.claude.json")));
+        // The transcripts are a tree: a Task subagent creates a nested
+        // directory mid-session and its usage appears nowhere else.
+        assert!(roots.contains(&WatchRoot::tree(PathBuf::from("/home/.claude/projects"))));
+        // The config file's parent, not the file: an atomic write replaces the
+        // inode and a watch on the old one would go quiet forever. Shallow,
+        // because that parent is the user's home directory and following it
+        // recursively subscribes to every write on the machine.
+        assert!(roots.contains(&WatchRoot::shallow(PathBuf::from("/home"))));
+        assert!(!roots
+            .iter()
+            .any(|root| root.recursive && root.path == std::path::Path::new("/home")));
+        assert!(!roots
+            .iter()
+            .any(|root| root.path == std::path::Path::new("/home/.claude.json")));
     }
 }

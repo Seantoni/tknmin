@@ -69,8 +69,14 @@ export interface QuotaProjection {
   spanMinutes: number;
   /** How many confirmed-reading pairs the fitted rate rests on. */
   pairs: number;
-  /** Widest deviation from the fitted rate, as a percent of it. */
+  /** How far a typical reading sits from the fitted rate, as a percent of it —
+   * the median deviation, so it describes the fit rather than its worst
+   * member and does not drift as readings accumulate. Meaningless, and
+   * reported as zero, when `provisional`. */
   residualPercent: number;
+  /** True when the rate rests on a single span with nothing to check it
+   * against — measured, but not yet corroborated. */
+  provisional: boolean;
 }
 
 /** One allowance window's pace and what it implies. */

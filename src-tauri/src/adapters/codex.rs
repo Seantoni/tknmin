@@ -30,7 +30,7 @@ use crate::domain::{
 
 use super::{
     file_identity, read_from_offset, split_complete_lines, AdapterError, DeltaRequest,
-    DiscoveredSource, RawSourceInput, SourceAdapter, SourceDelta, SyncMode,
+    DiscoveredSource, RawSourceInput, SourceAdapter, SourceDelta, SyncMode, WatchRoot,
 };
 
 const SESSIONS_DIR: &str = "sessions";
@@ -117,8 +117,11 @@ impl SourceAdapter for CodexAdapter {
 
     /// Both trees, because a rollout is written under `sessions/` and moved
     /// under `archived_sessions/` when the session ends.
-    fn watch_roots(&self) -> Vec<PathBuf> {
-        vec![self.root.join(SESSIONS_DIR), self.root.join(ARCHIVED_DIR)]
+    fn watch_roots(&self) -> Vec<WatchRoot> {
+        vec![
+            WatchRoot::tree(self.root.join(SESSIONS_DIR)),
+            WatchRoot::tree(self.root.join(ARCHIVED_DIR)),
+        ]
     }
 
     fn read_delta(&self, request: &DeltaRequest) -> Result<SourceDelta, AdapterError> {

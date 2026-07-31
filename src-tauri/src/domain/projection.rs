@@ -25,8 +25,9 @@
 //!
 //! Three rules keep a derived number from being passed off as a measured one:
 //!
-//! - a projection is only offered when the fit is backed by enough pairs and
-//!   its residual spread is small enough to mean anything;
+//! - a projection is only offered when the fit is backed by enough spans and
+//!   they typically agree, measured so that gathering more of them cannot make
+//!   the test harder to pass than it was;
 //! - a projection spanning longer than [`MAX_PROJECTION_MINUTES`] is refused,
 //!   because open-loop error grows with the span and no anchor has arrived to
 //!   bound it;
@@ -55,6 +56,25 @@ const RATE_SCALE: u64 = 1_000_000_000_000;
 /// Two spans cannot disagree, so they cannot reveal that the model is wrong.
 const MIN_PAIRS: usize = 3;
 
+/// The movement one span must carry to stand alone, before three of them
+/// exist.
+///
+/// Three spans are what it takes to *check* a rate; they are not what it takes
+/// to estimate one. Until they accumulate the interface has no derived number
+/// at all, and that gap is not evenly distributed — it falls on a fresh
+/// install, on a plan change, and on any window whose length makes movement
+/// slow to add up. Claude's week needs three separate 2% moves, which is hours
+/// of work; for all of them the confirmed reading is up to fourteen minutes
+/// old, which is exactly the stretch a projection exists to cover.
+///
+/// A single span this large is a usable estimate on its own: at 5% the
+/// quantisation error is about one part in fifty, against one in twenty at
+/// [`MIN_PAIR_TENTHS`]. It cannot be checked for stability, so it is marked
+/// [`QuotaCalibration::provisional`] and says so on screen — but a marked
+/// estimate is worth more than a number that sits still for a quarter of an
+/// hour while the allowance behind it drains.
+const BOOTSTRAP_TENTHS: u16 = 50;
+
 /// The smallest movement a span must accumulate before it can be fitted. The
 /// source reports tenths, so a two-point move carries a quantisation error of
 /// roughly one part in twenty; anything smaller is mostly rounding.
@@ -64,9 +84,18 @@ const MIN_PAIRS: usize = 3;
 /// each stored reading moves by a tenth or two — ever be fitted at all.
 const MIN_PAIR_TENTHS: u16 = 20;
 
-/// The widest spread a fit may show, as a percentage of its own median, before
-/// it is treated as not having found a stable rate. A shifting model mix or an
-/// allowance being spent somewhere this app cannot see both show up here.
+/// How far a typical span may sit from the fitted rate, as a percentage of it,
+/// before the fit is treated as not having found a stable rate. A shifting
+/// model mix or an allowance being spent somewhere this app cannot see both
+/// show up here.
+///
+/// Loose on purpose. The gate exists to catch a rate that means nothing, not to
+/// demand precision: a span only has to move [`MIN_PAIR_TENTHS`] to be counted,
+/// and the source reports whole tenths, so ±5% is quantisation before anything
+/// real is measured — and the skew between when the source observed its meter
+/// and when the local records were written adds more. What it does still reject
+/// is a source whose spans genuinely disagree; Cursor's billing cycle measures
+/// 39% here, against 11-12% for Claude's two windows.
 const MAX_RESIDUAL_PERCENT: u32 = 35;
 
 /// The longest a projection may run ahead of its confirmed reading. Beyond
@@ -177,15 +206,32 @@ pub struct QuotaCalibration {
     pub tenths_per_tera_unit: u64,
     /// How many confirmed-reading spans the fit rests on.
     pub pairs: usize,
-    /// The widest deviation from the median rate, as an integer percent of it.
-    /// Small means the model explains the data; large means something else is
-    /// moving the allowance.
+    /// How far a typical span sits from the fitted rate, as an integer percent
+    /// of it — the median deviation, so it describes the fit rather than its
+    /// worst member. Small means the model explains the data; large means
+    /// something else is moving the allowance.
+    ///
+    /// Meaningless on a provisional fit, which has nothing to deviate from
+    /// itself, and reported as zero there rather than as a claim of precision.
     pub residual_percent: u32,
+    /// True when this rests on a single large span rather than on spans that
+    /// agree with each other — an estimate that has not been checked, only
+    /// made. Travels to the interface so a number derived from it can say so.
+    pub provisional: bool,
 }
 
 impl QuotaCalibration {
     /// Whether this fit has earned the right to move a number on screen.
+    ///
+    /// Two ways to earn it, and they are not the same claim. Several spans
+    /// that agree establish a rate *and* demonstrate it is stable. One large
+    /// span establishes a rate and demonstrates nothing — which is still worth
+    /// showing, marked, because the alternative is showing a reading that
+    /// stopped being current a quarter of an hour ago.
     pub fn is_trustworthy(&self) -> bool {
+        if self.provisional {
+            return self.pairs >= 1;
+        }
         self.pairs >= MIN_PAIRS && self.residual_percent <= MAX_RESIDUAL_PERCENT
     }
 
@@ -230,6 +276,9 @@ pub struct QuotaProjection {
     /// implicit.
     pub pairs: usize,
     pub residual_percent: u32,
+    /// True when the rate behind this rests on a single span that could not be
+    /// checked against any other. See [`QuotaCalibration::provisional`].
+    pub provisional: bool,
 }
 
 /// Fit one rate per live window, from the confirmed readings already stored.
@@ -275,7 +324,11 @@ fn fit_window(
     // carrying forward is the one that never gets it. Spans spanning a reset
     // are still refused: the used figure drops to zero across one, and
     // differencing it invents a negative.
-    let mut rates: Vec<u64> = Vec::new();
+    //
+    // Each span is kept with the movement it was measured across, because that
+    // is what says how much one span on its own is worth: see the bootstrap
+    // below.
+    let mut spans: Vec<(u64, u16)> = Vec::new();
     let mut anchor = 0;
     for index in 1..window.len() {
         let (left, right) = (window[anchor], window[index]);
@@ -307,26 +360,42 @@ fn fit_window(
         // Rounded so the rate a span yields, applied back to that span's own
         // spend, reproduces the movement it was fitted from.
         let numerator = u64::from(moved).saturating_mul(RATE_SCALE);
-        rates.push((numerator + units / 2) / units);
+        spans.push(((numerator + units / 2) / units, moved));
     }
 
-    if rates.len() < MIN_PAIRS {
-        return None;
+    if spans.len() < MIN_PAIRS {
+        return bootstrap_from_one_span(quota, &spans);
     }
 
+    let mut rates: Vec<u64> = spans.iter().map(|(rate, _)| *rate).collect();
     rates.sort_unstable();
     let median = rates[rates.len() / 2];
     if median == 0 {
         return None;
     }
-    // Spread rather than variance: the question is not how noisy the fit is on
-    // average but how wrong one projection could be, and the worst pair
-    // answers that directly.
-    let worst = rates
-        .iter()
-        .map(|rate| rate.abs_diff(median))
-        .max()
-        .unwrap_or(0);
+
+    // The median deviation from the median rate, not the largest one.
+    //
+    // Reaching for the worst span is the intuitive move — it seems to answer
+    // "how wrong could one projection be" — but it makes the gate a function of
+    // how long the app has been running rather than of how good the fit is. The
+    // largest deviation in a sample can only grow as spans accumulate, so a
+    // window that qualifies on its third span stops qualifying on its eighth
+    // and never qualifies again, however well the rate is established. Measured
+    // on this machine's own store, Claude's session window ran 31% → 38% → 44%
+    // → 45% across its first three, five, eight and ten spans, crossing the
+    // threshold for good somewhere in the fourth — while the median deviation
+    // sat at 11% throughout, which is what the fit actually deserved.
+    //
+    // A median deviation is bounded by the population, not the sample size, so
+    // more evidence now moves this toward the truth in either direction instead
+    // of only upward. One anomalous span — an allowance moved by something this
+    // app cannot see — no longer vetoes every projection that follows it, and a
+    // source whose spans genuinely disagree still fails, because disagreement
+    // that widespread moves the median deviation too.
+    let mut deviations: Vec<u64> = rates.iter().map(|rate| rate.abs_diff(median)).collect();
+    deviations.sort_unstable();
+    let spread = deviations[deviations.len() / 2];
 
     Some(QuotaCalibration {
         source_app: quota.source_app,
@@ -334,7 +403,42 @@ fn fit_window(
         window_minutes: quota.window_minutes,
         tenths_per_tera_unit: median,
         pairs: rates.len(),
-        residual_percent: (worst.saturating_mul(100) / median).min(u64::from(u32::MAX)) as u32,
+        residual_percent: (spread.saturating_mul(100) / median).min(u64::from(u32::MAX)) as u32,
+        provisional: false,
+    })
+}
+
+/// The best estimate available before three spans exist: the single span that
+/// moved furthest, if it moved far enough to stand alone.
+///
+/// The widest span is the right one to take rather than the newest or the
+/// average. Quantisation error is inversely proportional to how far the reading
+/// travelled, so the widest span is by construction the least noisy observation
+/// on hand — and averaging two spans that cannot be checked against each other
+/// only hides which of them was the outlier.
+///
+/// This is the same estimator the fitted path uses, on less evidence. It is not
+/// a guess at what the rate might be, and nothing here is assumed about the
+/// user's plan or model mix: the number still comes from this window's own
+/// movement against this machine's own records. What it lacks is corroboration,
+/// which is why it is marked.
+fn bootstrap_from_one_span(quota: &UsageQuota, spans: &[(u64, u16)]) -> Option<QuotaCalibration> {
+    let (rate, _) = spans
+        .iter()
+        .filter(|(rate, moved)| *rate > 0 && *moved >= BOOTSTRAP_TENTHS)
+        .max_by_key(|(_, moved)| *moved)?;
+
+    Some(QuotaCalibration {
+        source_app: quota.source_app,
+        label: quota.label.clone(),
+        window_minutes: quota.window_minutes,
+        tenths_per_tera_unit: *rate,
+        pairs: 1,
+        // Nothing to deviate from: one span agrees with itself perfectly, and
+        // reporting that as a spread of zero would read as precision this has
+        // not earned. `provisional` is the honest field here.
+        residual_percent: 0,
+        provisional: true,
     })
 }
 
@@ -395,6 +499,7 @@ fn project_window(
         span_minutes,
         pairs: calibration.pairs,
         residual_percent: calibration.residual_percent,
+        provisional: calibration.provisional,
     })
 }
 
@@ -507,6 +612,10 @@ mod tests {
         }
     }
 
+    /// The rate every [`steady_history`] span yields: 100 tenths per Opus call
+    /// of 100k input and 10k output, scaled by [`RATE_SCALE`].
+    const STEADY_RATE: u64 = 444_444;
+
     /// Four readings ten minutes apart, each preceded by the same spend, so
     /// the rate is identical across every pair.
     fn steady_history() -> (Vec<QuotaSample>, Vec<UsageRecord>) {
@@ -553,7 +662,10 @@ mod tests {
     }
 
     #[test]
-    fn too_few_pairs_produce_no_fit() {
+    fn one_wide_span_bootstraps_a_provisional_rate() {
+        // Not enough to check a rate against anything — but the rate itself is
+        // measured, from a 10% move, and saying so beats leaving the window
+        // with no derived number for the hours it takes to gather three spans.
         let samples = vec![sample(0, 0), sample(10, 100)];
         let records = vec![record(
             SourceApp::ClaudeCode,
@@ -562,7 +674,37 @@ mod tests {
             100_000,
             10_000,
         )];
-        assert!(fit_calibrations(&[quota(100, 10)], &samples, &records).is_empty());
+        let fits = fit_calibrations(&[quota(100, 10)], &samples, &records);
+        assert_eq!(fits.len(), 1);
+        assert!(fits[0].provisional, "one span cannot corroborate itself");
+        assert_eq!(fits[0].pairs, 1);
+        assert_eq!(fits[0].tenths_per_tera_unit, STEADY_RATE);
+        assert!(fits[0].is_trustworthy(), "marked, but still worth showing");
+    }
+
+    #[test]
+    fn a_span_too_narrow_to_stand_alone_bootstraps_nothing() {
+        // Wide enough to be counted as a span, not wide enough to carry a
+        // projection by itself: 2% of a window is one part in twenty of
+        // quantisation before anything real is measured.
+        let samples = vec![sample(0, 0), sample(10, 20)];
+        let records = vec![record(
+            SourceApp::ClaudeCode,
+            5,
+            "claude-opus-5",
+            100_000,
+            10_000,
+        )];
+        assert!(fit_calibrations(&[quota(20, 10)], &samples, &records).is_empty());
+    }
+
+    #[test]
+    fn a_third_span_replaces_the_bootstrap_with_a_checked_fit() {
+        let (samples, records) = steady_history();
+        let fits = fit_calibrations(&[quota(300, 30)], &samples, &records);
+        assert_eq!(fits.len(), 1);
+        assert!(!fits[0].provisional, "three spans can be checked");
+        assert_eq!(fits[0].pairs, 3);
     }
 
     /// Cursor's monthly billing pool.
@@ -652,8 +794,14 @@ mod tests {
         samples[3].used_percent_tenths = 100;
         let records = steady_history().1;
 
-        // Only the first pair and the last survive — two, below the minimum.
-        assert!(fit_calibrations(&[quota(100, 30)], &samples, &records).is_empty());
+        // Only the first span and the last survive. What matters is not how
+        // many there are but that neither straddles the reset: the drop to
+        // zero is never differenced, so the rate stays the steady one rather
+        // than the negative that differencing across it would invent.
+        let fits = fit_calibrations(&[quota(100, 30)], &samples, &records);
+        assert_eq!(fits.len(), 1);
+        assert_eq!(fits[0].tenths_per_tera_unit, STEADY_RATE);
+        assert!(fits[0].provisional, "two spans, so nothing is corroborated");
     }
 
     #[test]
@@ -663,7 +811,73 @@ mod tests {
         let (samples, mut records) = steady_history();
         records.retain(|record| record.event_timestamp_utc != Some(at(15)));
         let fits = fit_calibrations(&[quota(300, 30)], &samples, &records);
-        assert!(fits.is_empty(), "a pair with no spend must be dropped");
+        assert_eq!(fits.len(), 1);
+        // Two spans survive instead of three, and the unexplained one is not
+        // among them: had it been kept, dividing a real movement by no spend
+        // at all would have fitted a rate orders of magnitude too high.
+        assert_eq!(fits[0].tenths_per_tera_unit, STEADY_RATE);
+        assert!(fits[0].provisional);
+    }
+
+    /// `count` readings ten minutes apart, all at the same rate except the
+    /// `odd_one`th span, whose spend is `odd_factor` times the usual — an
+    /// allowance moved by something the records cannot see.
+    fn history_with_one_odd_span(
+        count: usize,
+        odd_one: usize,
+        odd_factor: u64,
+    ) -> (Vec<QuotaSample>, Vec<UsageRecord>) {
+        let samples = (0..=count)
+            .map(|step| sample(step as i64 * 10, step as u16 * 100))
+            .collect();
+        let records = (0..count)
+            .map(|step| {
+                let factor = if step == odd_one { odd_factor } else { 1 };
+                record(
+                    SourceApp::ClaudeCode,
+                    step as i64 * 10 + 5,
+                    "claude-opus-5",
+                    100_000 * factor,
+                    10_000 * factor,
+                )
+            })
+            .collect();
+        (samples, records)
+    }
+
+    #[test]
+    fn one_anomalous_span_does_not_veto_a_rate_the_rest_agree_on() {
+        // Five spans, four of which agree exactly and one of which is four
+        // times the spend for the same movement. Judged by its worst member
+        // the fit looks 75% wrong; judged by a typical member it is exact,
+        // which is what four agreeing spans have actually established.
+        let (samples, records) = history_with_one_odd_span(5, 2, 4);
+        let fits = fit_calibrations(&[quota(300, 30)], &samples, &records);
+        assert_eq!(fits.len(), 1);
+        assert_eq!(fits[0].pairs, 5);
+        assert_eq!(fits[0].residual_percent, 0, "four of five spans agree");
+        assert!(fits[0].is_trustworthy());
+    }
+
+    #[test]
+    fn a_fit_does_not_get_harder_to_trust_as_evidence_accumulates() {
+        // The regression this replaced: the gate was the largest deviation in
+        // the sample, which can only grow as spans are added, so a window
+        // qualified early and then lost its projection permanently — the fit
+        // improving all the while. Every prefix of one history must reach the
+        // same verdict.
+        let (samples, records) = history_with_one_odd_span(12, 3, 3);
+        let quota = quota(300, 30);
+        for count in MIN_PAIRS..=12 {
+            let prefix: Vec<QuotaSample> = samples.iter().take(count + 1).cloned().collect();
+            let fits = fit_calibrations(std::slice::from_ref(&quota), &prefix, &records);
+            assert_eq!(fits.len(), 1, "{count} spans");
+            assert!(
+                fits[0].is_trustworthy(),
+                "{count} spans should stay trustworthy, spread was {}%",
+                fits[0].residual_percent
+            );
+        }
     }
 
     #[test]
@@ -832,6 +1046,7 @@ mod tests {
             window_minutes: 10_080,
             tenths_per_tera_unit: 500_000,
             pairs: 10,
+            provisional: false,
             residual_percent: 5,
         };
         // Far more than any real month, and still clamped rather than wrapped.

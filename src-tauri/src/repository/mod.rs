@@ -196,6 +196,33 @@ pub struct DashboardSnapshot {
     pub projections: Vec<QuotaProjection>,
 }
 
+/// Everything about *allowances* at one revision, and nothing about totals.
+///
+/// The same four fields the dashboard snapshot carries, read the same way at
+/// one revision — but without the two summaries, the thread report, the record
+/// list and the count that sit beside them there.
+///
+/// That difference is not small. Measured against a 50,000-record store, a
+/// dashboard snapshot costs about 460ms, of which the allowance half is 30ms:
+/// the rest is aggregation that deserialises every record's payload. The
+/// compact window renders allowances only, and the menu bar less than that, so
+/// asking either of them to pay the other 430ms put a third of a second of
+/// work behind every refresh they could otherwise have done fifteen times
+/// over.
+///
+/// Freshness is why that mattered rather than merely being wasteful: a window
+/// that takes 460ms to redraw cannot follow a source that changes every
+/// couple of seconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RiskSnapshot {
+    pub revision: RepositoryRevision,
+    pub quotas: Vec<UsageQuota>,
+    pub health: Vec<SourceSyncHealth>,
+    pub pace: Vec<WindowPace>,
+    pub projections: Vec<QuotaProjection>,
+}
+
 /// Read-only access. Everything but the coordinator gets this.
 pub trait UsageReader: Send + Sync {
     fn summary(&self, query: &SummaryQuery) -> Result<UsageSummary, RepositoryError>;
@@ -240,6 +267,10 @@ pub trait UsageReader: Send + Sync {
         overview: &SummaryQuery,
         recent: &RecentQuery,
     ) -> Result<DashboardSnapshot, RepositoryError>;
+
+    /// One consistent read of the allowance half alone — see [`RiskSnapshot`]
+    /// for why the two are separate reads rather than one.
+    fn risk_snapshot(&self) -> Result<RiskSnapshot, RepositoryError>;
 
     /// Just the pace of every live window, for callers that need risk and
     /// nothing else — the alert lane runs this on every refresh tick and every
@@ -293,6 +324,27 @@ pub(crate) fn assemble_snapshot(
         })?,
         recent: reader.recent(recent_query)?,
         record_count: reader.count()?,
+        quotas,
+        health: reader.health()?,
+        pace,
+        projections,
+    })
+}
+
+/// Default allowance-only assembly, shared by the backends.
+///
+/// The same order and the same reasoning as [`assemble_snapshot`]: revision
+/// first so a commit landing mid-read is refetched rather than skipped, and
+/// one instant for the whole assembly.
+pub(crate) fn assemble_risk_snapshot(
+    reader: &dyn UsageReader,
+) -> Result<RiskSnapshot, RepositoryError> {
+    let now = Utc::now();
+    let revision = reader.revision()?;
+    let quotas = reader.quotas()?;
+    let (pace, projections) = assemble_risk(reader, &quotas, now)?;
+    Ok(RiskSnapshot {
+        revision,
         quotas,
         health: reader.health()?,
         pace,
@@ -791,6 +843,10 @@ mod tests {
             assemble_snapshot(self, overview, recent)
         }
 
+        fn risk_snapshot(&self) -> Result<RiskSnapshot, RepositoryError> {
+            assemble_risk_snapshot(self)
+        }
+
         fn pace(&self) -> Result<Vec<WindowPace>, RepositoryError> {
             assemble_pace_only(self)
         }
@@ -806,5 +862,50 @@ mod tests {
         reader
             .snapshot(&SummaryQuery::default(), &RecentQuery::default())
             .unwrap();
+    }
+
+    #[test]
+    fn the_risk_snapshot_reads_revision_before_any_payload_too() {
+        let reader = RevisionFirstReader {
+            inner: InMemoryUsageRepository::new(),
+            revision_read: AtomicBool::new(false),
+        };
+
+        reader.risk_snapshot().unwrap();
+    }
+
+    /// The narrow read is an optimisation, and an optimisation that answers a
+    /// different question is a bug. Whatever the two reads have in common they
+    /// must agree on exactly, or the compact window and the dashboard would
+    /// show different allowances for the same revision.
+    #[test]
+    fn the_two_reads_agree_on_everything_they_share() {
+        let repository = InMemoryUsageRepository::new();
+        let now = Utc.timestamp_opt(1_785_200_000, 0).unwrap();
+        let mut transaction = SourceTransaction::new(SourceApp::Codex, "codex", now);
+        transaction.quotas = vec![UsageQuota {
+            source_app: SourceApp::Codex,
+            label: None,
+            window_minutes: 10_080,
+            used_percent_tenths: 690,
+            resets_at: Some(now + chrono::Duration::days(3)),
+            observed_at: now,
+        }];
+        transaction.health = HealthOutcome::Succeeded {
+            source_observed_at: Some(now),
+            awaiting_upstream: false,
+        };
+        repository.commit(transaction).unwrap();
+
+        let full = repository
+            .snapshot(&SummaryQuery::default(), &RecentQuery::default())
+            .unwrap();
+        let risk = repository.risk_snapshot().unwrap();
+
+        assert_eq!(full.revision, risk.revision);
+        assert_eq!(full.quotas, risk.quotas);
+        assert_eq!(full.health, risk.health);
+        assert_eq!(full.pace, risk.pace);
+        assert_eq!(full.projections, risk.projections);
     }
 }

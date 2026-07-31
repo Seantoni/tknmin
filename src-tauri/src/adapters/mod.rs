@@ -244,6 +244,42 @@ pub struct AdapterInfo {
     pub needs_network: bool,
 }
 
+/// A directory to watch, and how deeply.
+///
+/// The depth belongs to the adapter because only it knows the shape of what it
+/// is watching. A tree of transcripts must be recursive — a subagent creates a
+/// nested directory mid-session and its usage appears nowhere else. A single
+/// well-known file must not be, and saying so matters: the only way to see an
+/// atomic replacement of `~/.claude.json` is to watch the directory holding
+/// it, which is the user's home. Recursively, that is a subscription to every
+/// write anywhere under `$HOME` — every `npm install`, every download, every
+/// `~/Library` churn — each one waking the classifier for a file no source has
+/// ever heard of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchRoot {
+    pub path: PathBuf,
+    /// True for a tree whose interesting files can appear at any depth.
+    pub recursive: bool,
+}
+
+impl WatchRoot {
+    /// A tree: everything under `path`, however deep.
+    pub fn tree(path: PathBuf) -> Self {
+        Self {
+            path,
+            recursive: true,
+        }
+    }
+
+    /// One directory's own entries, and nothing below them.
+    pub fn shallow(path: PathBuf) -> Self {
+        Self {
+            path,
+            recursive: false,
+        }
+    }
+}
+
 pub trait SourceAdapter: Send + Sync {
     /// Stable adapter identifier, recorded in every record's provenance.
     fn id(&self) -> &'static str;
@@ -259,7 +295,7 @@ pub trait SourceAdapter: Send + Sync {
     /// The adapter only names them. Registering, debouncing, and translating
     /// callbacks into work is the coordinator's job — an adapter that watched
     /// its own files would be a second refresh owner.
-    fn watch_roots(&self) -> Vec<PathBuf> {
+    fn watch_roots(&self) -> Vec<WatchRoot> {
         Vec::new()
     }
 

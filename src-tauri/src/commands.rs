@@ -18,7 +18,7 @@ use crate::domain::{
 use crate::error::AppError;
 use crate::prefs;
 use crate::refresh::RefreshTrigger;
-use crate::repository::DashboardSnapshot;
+use crate::repository::{DashboardSnapshot, RiskSnapshot};
 use crate::state::AppState;
 
 /// Everything one screen renders, read at a single revision.
@@ -38,6 +38,19 @@ pub fn dashboard_snapshot(
     validate(&overview)?;
     validate(&recent.filter)?;
     Ok(state.reader().snapshot(&overview, &recent)?)
+}
+
+/// The allowance half of a snapshot: what is left, how it is trending, and how
+/// fresh it is — at one revision, and without the aggregation the rest of a
+/// dashboard needs.
+///
+/// The compact window renders nothing else, so it asks for nothing else. Both
+/// windows still converge on the same committed revisions and cannot disagree;
+/// this one simply stops paying to summarise fifty thousand records it does
+/// not draw. See [`crate::repository::RiskSnapshot`] for the measurements.
+#[tauri::command]
+pub fn quota_snapshot(state: State<'_, AppState>) -> Result<RiskSnapshot, AppError> {
+    Ok(state.reader().risk_snapshot()?)
 }
 
 /// Totals and breakdowns for one filter.

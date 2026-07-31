@@ -15,7 +15,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 
-import { DATA_CHANGED, fetchDashboardSnapshot, toAppError } from "../api/usage";
+import { DATA_CHANGED, fetchRiskSnapshot, toAppError } from "../api/usage";
 import type { AppError, DataChanged, SourceSyncHealth, UsageQuota } from "../domain/usage";
 import type { QuotaProjection, WindowPace } from "../domain/pace";
 
@@ -44,10 +44,12 @@ export function useQuotas(): Quotas {
 
   const load = useCallback(async () => {
     try {
-      // The compact window renders no records, so it asks for none. The
-      // snapshot still reads everything at one revision, which is what keeps
-      // the two windows in agreement.
-      const snapshot = await fetchDashboardSnapshot({}, { limit: 0 });
+      // The compact window renders no records and no totals, so it asks for
+      // neither. Still one read at one revision, which is what keeps the two
+      // windows in agreement — it simply stops summarising a store it does
+      // not draw, which is most of what a dashboard snapshot costs and the
+      // difference between redrawing in 30ms and in a third of a second.
+      const snapshot = await fetchRiskSnapshot();
       if (!isMounted.current) return;
       revision.current = snapshot.revision;
       setQuotas(snapshot.quotas);
