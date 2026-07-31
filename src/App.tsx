@@ -10,6 +10,7 @@ import { DashboardSkeleton, SettingsSkeleton } from "./components/Skeletons";
 import { SourceHealthRow } from "./components/SourceHealth";
 import { SourceStrip } from "./components/SourceStrip";
 import { StatBar } from "./components/StatBar";
+import { ThreadUsage } from "./components/ThreadUsage";
 import { DASHBOARD_WINDOW_DAYS, useUsageDashboard } from "./hooks/useUsageDashboard";
 import { useOptions } from "./hooks/useOptions";
 import { useThresholdAlerts } from "./hooks/useThresholdAlerts";
@@ -126,22 +127,23 @@ function App() {
               return (
                 <span
                   key={quota.sourceApp}
-                  className={`quota${pace !== undefined && (pace.state === "red" || pace.state === "amber") ? ` is-${pace.state}` : ""}`}
+                  className={`quota${pace !== undefined && (pace.state === "red" || pace.state === "amber" || pace.state === "green") ? ` is-${pace.state}` : ""}`}
                   title={describeQuotaWindows(
                     (snapshot?.quotas ?? []).filter((each) => each.sourceApp === quota.sourceApp),
                   )}
                 >
                   {SOURCE_LABEL[quota.sourceApp]} ·{" "}
-                  {formatPercentTenths(quotaRemainingTenths(quota))} left{" "}
+                  <span className={pace?.state === "red" ? "quota-left is-red" : undefined}>
+                    {formatPercentTenths(quotaRemainingTenths(quota))} left
+                  </span>{" "}
                   {describeQuotaWindow(quota.windowMinutes)}
-                  {verdict !== null &&
-                    (pace?.state === "red" || pace?.state === "amber") && (
-                      <span className="quota-pace">
-                        {" "}
-                        · {verdict}
-                        {gap !== null && ` · ${gap}`}
-                      </span>
-                    )}
+                  {verdict !== null && (
+                    <span className="quota-pace">
+                      {" "}
+                      · {verdict}
+                      {gap !== null && ` · ${gap}`}
+                    </span>
+                  )}
                 </span>
               );
             })}
@@ -266,6 +268,8 @@ function App() {
                   </section>
 
                   <ModelBreakdown groups={snapshot.summary.byModel} />
+
+                  <ThreadUsage report={snapshot.threadUsage} />
 
                   <section className="block">
                     <div className="block-head">

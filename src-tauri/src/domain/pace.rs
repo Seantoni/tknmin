@@ -69,7 +69,8 @@ pub enum PaceState {
     Red,
     /// Nothing left.
     Exhausted,
-    /// No pace could be measured, or the reading is too old to project from.
+    /// No pace could be measured, or the reading is too old to project from
+    /// while the source is still spending.
     Unknown,
 }
 
@@ -266,7 +267,21 @@ fn evaluate_window(
     let t_minutes = minutes_until(resets_at, now);
     let age_minutes = age_in_minutes(quota.observed_at, now);
     if age_minutes > staleness_limit(quota.window_minutes) {
-        pace.state = PaceState::Unknown;
+        // A stale percentage overstates what remains only when the source kept
+        // spending after the reading. Token throughput over the last hour is
+        // independent evidence: no burn means the reading is still the truth
+        // and the honest state is idle, not "too old to say." A non-zero burn
+        // with a stale meter is the failure mode — we are behind on the
+        // allowance itself — and that stays Unknown.
+        let still_burning = recent_rates
+            .iter()
+            .find(|rate| rate.source_app == quota.source_app)
+            .is_some_and(|rate| rate.tokens_per_hour > 0);
+        pace.state = if still_burning {
+            PaceState::Unknown
+        } else {
+            PaceState::Green
+        };
         return pace;
     }
 
@@ -439,10 +454,12 @@ fn trailing_horizons(window_minutes: u32, duty_cycle_percent: Option<u32>) -> Ve
     horizons
 }
 
-/// How old a reading may be before it cannot support a projection. Staleness
-/// cuts the wrong way here: `resets_at` is absolute so time-to-reset is always
-/// live, but `used_percent_tenths` is only as fresh as `observed_at`, and a
-/// stale reading *overstates* what remains. Long windows tolerate older
+/// How old a reading may be before it cannot support a projection on its own.
+/// Staleness cuts the wrong way here: `resets_at` is absolute so time-to-reset
+/// is always live, but `used_percent_tenths` is only as fresh as `observed_at`,
+/// and a stale reading *overstates* what remains when the source kept
+/// spending. Callers that can see the source has gone quiet may still treat
+/// an aged reading as idle rather than unknown. Long windows tolerate older
 /// readings because a week's pace does not change in an hour.
 fn staleness_limit(window_minutes: u32) -> u32 {
     (window_minutes / 10).max(MIN_TOLERANCE_MINUTES)
@@ -527,13 +544,34 @@ mod tests {
     }
 
     #[test]
-    fn unknown_when_the_reading_is_too_old_to_project() {
+    fn unknown_when_the_reading_is_too_old_and_the_source_is_still_burning() {
         let now = at(10);
         // A 5-hour session tolerates max(300/10, 15) = 30 minutes of age.
         let quota = quota(500, 60, 300, 45, now);
-        let pace = pace_of(&quota, now);
+        let pace = evaluate_pace(
+            std::slice::from_ref(&quota),
+            &[],
+            &[],
+            &burning(1_000),
+            0,
+            now,
+        )
+        .remove(0);
         assert_eq!(pace.state, PaceState::Unknown);
         assert_eq!(pace.runway_minutes, None, "unknown never carries a runway");
+    }
+
+    #[test]
+    fn idle_while_stale_is_green_not_unknown() {
+        // Codex (and any local-file source) only restates its meter when it
+        // spends. A day of silence ages the reading past the window's
+        // staleness limit even though the percentage is still exact — and
+        // blanking the row then hides the one fact the user can act on.
+        let now = at(10);
+        let quota = quota(500, 60, 300, 45, now);
+        let pace = pace_of(&quota, now);
+        assert_eq!(pace.state, PaceState::Green);
+        assert_eq!(pace.runway_minutes, None, "idle carries no runway");
     }
 
     #[test]
@@ -863,21 +901,27 @@ mod tests {
     #[test]
     fn no_input_produces_green_without_confidence() {
         // Forbidding the dangerous failure mode: Green is only ever asserted
-        // from an actual reading or an honestly-measured idle.
+        // from an actual reading or an honestly-measured idle. A stale meter
+        // while the source is still burning is the case that must not green —
+        // silence with no burn is honest idle, covered above.
         let now = at(10);
-        let cases = [
-            quota(0, 60, 300, 45, now),    // stale: must not be green
-            quota(1_000, 60, 300, 0, now), // empty: must not be green
-        ];
-        let mut quota = quota(0, 0, 300, 0, now);
-        quota.resets_at = None; // not started: must not be green
-        let all = cases.iter().chain(std::iter::once(&quota));
-        for quota in all {
-            assert_ne!(
-                pace_of(quota, now).state,
-                PaceState::Green,
-                "a window without a trustworthy pace asserted green"
-            );
-        }
+        let stale = quota(500, 60, 300, 45, now);
+        let stale_while_burning = evaluate_pace(
+            std::slice::from_ref(&stale),
+            &[],
+            &[],
+            &burning(1_000),
+            0,
+            now,
+        )
+        .remove(0);
+        assert_ne!(stale_while_burning.state, PaceState::Green);
+
+        let exhausted = quota(1_000, 60, 300, 0, now);
+        assert_ne!(pace_of(&exhausted, now).state, PaceState::Green);
+
+        let mut not_started = quota(0, 0, 300, 0, now);
+        not_started.resets_at = None;
+        assert_ne!(pace_of(&not_started, now).state, PaceState::Green);
     }
 }

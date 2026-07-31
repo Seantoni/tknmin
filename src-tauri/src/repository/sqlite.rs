@@ -22,9 +22,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::domain::{
-    same_window_instance, QuotaSample, RecentQuery, RepositoryRevision, SourceApp,
-    SourceCheckpoint, SourceSyncHealth, SummaryQuery, SyncState, UsageQuota, UsageRecord,
-    UsageSummary, WindowPace,
+    group_threads, same_window_instance, QuotaSample, RecentQuery, RepositoryRevision, SourceApp,
+    SourceCheckpoint, SourceSyncHealth, SummaryQuery, SyncState, ThreadUsageQuery,
+    ThreadUsageReport, UsageQuota, UsageRecord, UsageSummary, WindowPace,
 };
 
 use super::summarize;
@@ -289,6 +289,20 @@ impl UsageReader for SqliteUsageRepository {
         self.with_connection(|connection| {
             let matching = SqliteUsageRepository::load_matching(connection, &query.filter)?;
             Ok(summarize::take_recent(matching.iter().collect(), query))
+        })
+    }
+
+    fn thread_usage(&self, query: &ThreadUsageQuery) -> Result<ThreadUsageReport, RepositoryError> {
+        self.with_connection(|connection| {
+            let undated_all = SqliteUsageRepository::load_all(connection)?;
+            let undated = summarize::undated_excluded(undated_all.iter(), &query.filter);
+            let matching = SqliteUsageRepository::load_matching(connection, &query.filter)?;
+            Ok(group_threads(
+                matching.iter(),
+                Utc::now(),
+                undated,
+                query.effective_limit(),
+            ))
         })
     }
 

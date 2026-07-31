@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::money::Money;
+use super::record::UsageRecord;
 use super::source::SourceApp;
 
 /// A summed token category.
@@ -67,6 +68,45 @@ pub struct UsageTotals {
     /// per record; `TokenTotal::unknown_records` counts records with none.
     pub display_total: TokenTotal,
     pub cost: CostTotal,
+}
+
+impl UsageTotals {
+    /// Fold one record in. This is the single accumulation every breakdown
+    /// shares — source, model, thread — so no grouping can drift from the
+    /// others in what it counts.
+    pub fn add_record(&mut self, record: &UsageRecord) {
+        self.record_count += 1;
+        self.input.add(record.tokens.input.countable());
+        self.output.add(record.tokens.output.countable());
+        self.cached_input.add(record.tokens.cached_input.countable());
+        self.reasoning.add(record.tokens.reasoning.countable());
+        self.display_total
+            .add(record.display_total.map(|total| total.tokens));
+
+        let Some(amount) = &record.cost.amount else {
+            self.cost.records_without_cost += 1;
+            return;
+        };
+        match self
+            .cost
+            .by_currency
+            .iter_mut()
+            .find(|entry| entry.amount.currency == amount.currency)
+        {
+            Some(entry) => {
+                // Only an i64 overflow can fail here, which no realistic token
+                // spend reaches; the running total is kept rather than poisoned.
+                if let Ok(sum) = entry.amount.checked_add(amount) {
+                    entry.amount = sum;
+                    entry.counted_records += 1;
+                }
+            }
+            None => self.cost.by_currency.push(CurrencyTotal {
+                amount: amount.clone(),
+                counted_records: 1,
+            }),
+        }
+    }
 }
 
 /// How a breakdown row is identified.

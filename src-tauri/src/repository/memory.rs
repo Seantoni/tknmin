@@ -11,9 +11,9 @@ use std::sync::RwLock;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    same_window_instance, QuotaSample, RecentQuery, RepositoryRevision, SourceApp,
-    SourceCheckpoint, SourceSyncHealth, SummaryQuery, UsageQuota, UsageRecord, UsageSummary,
-    WindowPace,
+    group_threads, same_window_instance, QuotaSample, RecentQuery, RepositoryRevision, SourceApp,
+    SourceCheckpoint, SourceSyncHealth, SummaryQuery, ThreadUsageQuery, ThreadUsageReport,
+    UsageQuota, UsageRecord, UsageSummary, WindowPace,
 };
 
 use super::summarize;
@@ -80,6 +80,21 @@ impl UsageReader for InMemoryUsageRepository {
             .filter(|record| summarize::matches(record, &query.filter))
             .collect();
         Ok(summarize::take_recent(matching, query))
+    }
+
+    fn thread_usage(&self, query: &ThreadUsageQuery) -> Result<ThreadUsageReport, RepositoryError> {
+        let store = self.read()?;
+        let undated = summarize::undated_excluded(store.records.values(), &query.filter);
+        let matching = store
+            .records
+            .values()
+            .filter(|record| summarize::matches(record, &query.filter));
+        Ok(group_threads(
+            matching,
+            Utc::now(),
+            undated,
+            query.effective_limit(),
+        ))
     }
 
     fn records_since(&self, since: DateTime<Utc>) -> Result<Vec<UsageRecord>, RepositoryError> {

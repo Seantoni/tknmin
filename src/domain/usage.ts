@@ -158,6 +158,42 @@ export interface RecentQuery {
   filter: SummaryQuery;
 }
 
+export interface ThreadUsageQuery {
+  filter: SummaryQuery;
+  limit: number;
+}
+
+/**
+ * One conversation's usage, mirroring `ThreadSummary`. Identity is the
+ * (source, session) pair: session ids are only unique inside their source.
+ */
+export interface ThreadSummary {
+  /** Stable key: `{source}:{sessionId}`. */
+  key: string;
+  sessionId: string;
+  sourceApp: SourceApp;
+  /** Where the thread's most recent dated record ran, when any record said. */
+  project: string | null;
+  /** Every model the thread used, sorted. */
+  models: string[];
+  totals: UsageTotals;
+  firstEventAt: string | null;
+  lastEventAt: string | null;
+}
+
+/** The per-thread breakdown, mirroring `ThreadUsageReport`. */
+export interface ThreadUsageReport {
+  generatedAt: string;
+  /** Grand totals over every thread-attributed record, capped list or not. */
+  totals: UsageTotals;
+  threads: ThreadSummary[];
+  /** Threads before the limit was applied. */
+  threadCount: number;
+  /** Records the filter kept but no thread claims. */
+  unattributedRecords: number;
+  undatedRecordsExcluded: number;
+}
+
 /**
  * Static facts about a source application.
  *
@@ -235,6 +271,8 @@ export interface DashboardSnapshot {
   overview: UsageSummary;
   /** Reflects the active filter. */
   summary: UsageSummary;
+  /** Per-thread usage under the same filter as {@link DashboardSnapshot.summary}. */
+  threadUsage: ThreadUsageReport;
   recent: UsageRecord[];
   recordCount: number;
   /**

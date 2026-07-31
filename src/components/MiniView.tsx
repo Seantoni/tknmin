@@ -7,7 +7,8 @@
  * The rows themselves are [`QuotaRows`], shared with the dashboard so the two
  * cannot drift apart, in one of three layouts the user cycles through here:
  * stacked, two lines around a bar in a narrow panel; horizontal, one complete
- * row per allowance in a wide one; or grid, the stacked block two across.
+ * row per allowance in a wide one; or grid, every block side by side in a
+ * single row.
  * What belongs to this file is the panel: its chrome, its drag region, its
  * layout toggle, and its size.
  *
@@ -23,9 +24,9 @@ import { fetchOptions, saveOptions, OPTIONS_CHANGED } from "../api/options";
 import {
   fitMiniWindowSize,
   showDashboardWindow,
+  miniGridWidth,
   MINI_WIDTH,
   MINI_WIDE_WIDTH,
-  MINI_GRID_WIDTH,
 } from "../api/window";
 import type { AppOptions, MiniLayout } from "../domain/options";
 import { QuotaRows } from "./QuotaRows";
@@ -43,7 +44,7 @@ const NEXT: Record<MiniLayout, { layout: MiniLayout; label: string; title: strin
   horizontal: {
     layout: "grid",
     label: "grid",
-    title: "the stacked blocks, two across",
+    title: "the blocks side by side, all in one row",
   },
   grid: {
     layout: "stacked",
@@ -52,12 +53,12 @@ const NEXT: Record<MiniLayout, { layout: MiniLayout; label: string; title: strin
   },
 };
 
-function widthFor(layout: MiniLayout): number {
+function widthFor(layout: MiniLayout, cells: number): number {
   switch (layout) {
     case "horizontal":
       return MINI_WIDE_WIDTH;
     case "grid":
-      return MINI_GRID_WIDTH;
+      return miniGridWidth(cells);
     case "stacked":
       return MINI_WIDTH;
   }
@@ -100,12 +101,13 @@ export function MiniView() {
 
   // Follow the panel's own height rather than recomputing it here: a wrapped
   // label or a source that starts reporting a second pool changes it too.
-  // The layout re-runs this because it decides the width on its own.
+  // The layout re-runs this because it decides the width — and in grid the
+  // width also follows how many blocks the sources currently report.
   useEffect(() => {
     const element = panel.current;
     if (element === null) return;
 
-    const width = widthFor(layout);
+    const width = widthFor(layout, quotas.length);
     const fit = () => {
       const height = Math.ceil(element.getBoundingClientRect().height);
       if (height > 0) void fitMiniWindowSize(width, height);
@@ -114,8 +116,15 @@ export function MiniView() {
     fit();
     const observer = new ResizeObserver(fit);
     observer.observe(element);
-    return () => observer.disconnect();
-  }, [layout]);
+    // The observer only fires when the panel itself changes size, so a fit
+    // made mid-reflow can leave the window stuck at a transient height the
+    // panel then never revisits. Re-fit a few times while the layout settles.
+    const settling = [50, 150, 400].map((ms) => window.setTimeout(fit, ms));
+    return () => {
+      observer.disconnect();
+      for (const timer of settling) window.clearTimeout(timer);
+    };
+  }, [layout, quotas.length]);
 
   const toggleLayout = () => {
     const next = NEXT[layout].layout;

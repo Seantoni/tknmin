@@ -148,6 +148,23 @@ export function formatDateSpan(records: UsageRecord[]): string | null {
   return first === last ? first : `${first} – ${last}`;
 }
 
+/**
+ * The span between two instants as dates: "Jul 30", or "Jul 29 – Jul 30"
+ * when they cross midnight. `null` when neither instant exists.
+ */
+export function formatInstantSpan(
+  first: string | null,
+  last: string | null,
+): string | null {
+  const start = first ?? last;
+  const end = last ?? first;
+  if (start === null || end === null) return null;
+
+  const a = shortDateFormat.format(new Date(start));
+  const b = shortDateFormat.format(new Date(end));
+  return a === b ? a : `${a} – ${b}`;
+}
+
 /** A share of a whole, rounded to whole percent. Zero totals yield zero. */
 export function share(value: number, total: number): number {
   if (total <= 0) return 0;
@@ -251,8 +268,11 @@ export interface QuotaGroup {
  * Cursor's own models cannot spend what is left of the others. Grouping is what
  * keeps those readable — two lines about Cursor have to look like Cursor's.
  *
- * Sources come in order of how close they are to running out, and a source's own
- * windows come shortest-first — the session before the week that contains it.
+ * Sources always come in the same order — codex, then claude, then cursor —
+ * because a glanceable panel earns its keep when every source keeps its own
+ * spot; an order that moves with the numbers has to be re-read every time. A
+ * source's own windows come shortest-first — the session before the week
+ * that contains it.
  */
 export function quotaGroups(quotas: UsageQuota[]): QuotaGroup[] {
   const groups = new Map<SourceApp, UsageQuota[]>();
@@ -273,12 +293,15 @@ export function quotaGroups(quotas: UsageQuota[]): QuotaGroup[] {
 
   return [...groups.entries()]
     .map(([sourceApp, windows]) => ({ sourceApp, windows }))
-    .sort((left, right) => tightestRemaining(left.windows) - tightestRemaining(right.windows));
+    .sort((left, right) => SOURCE_ORDER[left.sourceApp] - SOURCE_ORDER[right.sourceApp]);
 }
 
-function tightestRemaining(quotas: UsageQuota[]): number {
-  return Math.min(...quotas.map(quotaRemainingTenths));
-}
+/** The fixed reading order of the sources, first to last. */
+const SOURCE_ORDER: Record<SourceApp, number> = {
+  codex: 0,
+  claude_code: 1,
+  cursor: 2,
+};
 
 /** Identifies one window of one pool: a source, its label, and its length. */
 export function quotaRowKey(quota: UsageQuota): string {

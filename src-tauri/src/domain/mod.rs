@@ -17,6 +17,7 @@ pub mod record;
 pub mod source;
 pub mod summary;
 pub mod sync;
+pub mod thread_usage;
 pub mod tokens;
 
 pub use baseline::{
@@ -45,4 +46,5 @@ pub use summary::{
     UsageTotals,
 };
 pub use sync::{ReplaceScope, RepositoryRevision, SourceCheckpoint, SourceSyncHealth, SyncState};
+pub use thread_usage::{group_threads, ThreadSummary, ThreadUsageQuery, ThreadUsageReport};
 pub use tokens::{TokenCounts, TokenField};

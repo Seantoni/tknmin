@@ -713,6 +713,12 @@ button.strip-row:hover {
   color: var(--faint);
 }
 
+.strip-foot {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--faint);
+}
+
 /* Events */
 
 .events {
@@ -974,7 +980,15 @@ button.strip-row:hover {
 }
 
 .quota.is-red .quota-pace {
+  color: var(--danger);
+}
+
+.quota.is-amber .quota-pace {
   color: var(--text);
+}
+
+.quota-left.is-red {
+  color: var(--danger);
 }
 
 /* Allowance rows
@@ -1068,6 +1082,10 @@ button.strip-row:hover {
   flex: 0 0 auto;
   font-size: 12px;
   color: var(--text);
+}
+
+.q-left.is-red {
+  color: var(--danger);
 }
 
 /* Unclipped on purpose: the even-pace tick stands slightly clear of the bar on
@@ -1241,18 +1259,19 @@ button.strip-row:hover {
   font-size: 10px;
 }
 
-/* The grid mode: the stacked block, two across. Each cell is exactly the
- * block the narrow panel shows; the window is simply wide enough for the
- * next one to sit beside it instead of below. */
+/* The grid mode: every block side by side in one row, never wrapping. The
+ * window is sized from the cell count (see `miniGridWidth`), so the values
+ * here must stay in step with it. */
 .q-list.is-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
+  flex-direction: row;
   gap: 12px;
 }
 
-/* Grid items default to their content's width, which would let a long name
- * push the cell past its column; floor at zero so it ellipsizes instead. */
+/* A long name would rather push its cell wider than ellipsize; hold every
+ * cell at the agreed width and let the text give way instead. */
 .q-cell {
+  flex: 0 0 240px;
   min-width: 0;
   display: flex;
   flex-direction: column;

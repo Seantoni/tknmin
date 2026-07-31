@@ -8,8 +8,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    CostTotal, CurrencyTotal, GroupSummary, RecentQuery, SummaryQuery, UsageRecord, UsageSummary,
-    UsageTotals,
+    GroupSummary, RecentQuery, SummaryQuery, UsageRecord, UsageSummary, UsageTotals,
 };
 
 /// Whether a record passes the query's filters.
@@ -92,47 +91,6 @@ pub fn take_recent(records: Vec<&UsageRecord>, query: &RecentQuery) -> Vec<Usage
         .collect()
 }
 
-/// Accumulate one record into a set of totals.
-pub fn accumulate(totals: &mut UsageTotals, record: &UsageRecord) {
-    totals.record_count += 1;
-    totals.input.add(record.tokens.input.countable());
-    totals.output.add(record.tokens.output.countable());
-    totals
-        .cached_input
-        .add(record.tokens.cached_input.countable());
-    totals.reasoning.add(record.tokens.reasoning.countable());
-    totals
-        .display_total
-        .add(record.display_total.map(|total| total.tokens));
-    accumulate_cost(&mut totals.cost, record);
-}
-
-fn accumulate_cost(cost: &mut CostTotal, record: &UsageRecord) {
-    let Some(amount) = &record.cost.amount else {
-        cost.records_without_cost += 1;
-        return;
-    };
-
-    match cost
-        .by_currency
-        .iter_mut()
-        .find(|entry| entry.amount.currency == amount.currency)
-    {
-        Some(entry) => {
-            // Only an i64 overflow can fail here, which no realistic token
-            // spend reaches; the running total is kept rather than poisoned.
-            if let Ok(sum) = entry.amount.checked_add(amount) {
-                entry.amount = sum;
-                entry.counted_records += 1;
-            }
-        }
-        None => cost.by_currency.push(CurrencyTotal {
-            amount: amount.clone(),
-            counted_records: 1,
-        }),
-    }
-}
-
 /// Build the full summary for a set of records that already passed filtering.
 pub fn summarize<'a>(
     records: impl Iterator<Item = &'a UsageRecord>,
@@ -144,7 +102,7 @@ pub fn summarize<'a>(
     let mut by_model: BTreeMap<String, GroupSummary> = BTreeMap::new();
 
     for record in records {
-        accumulate(&mut totals, record);
+        totals.add_record(record);
 
         let source = by_source
             .entry(record.source_app.as_str().to_string())
@@ -153,7 +111,7 @@ pub fn summarize<'a>(
                 label: record.source_app.display_name().to_string(),
                 totals: UsageTotals::default(),
             });
-        accumulate(&mut source.totals, record);
+        source.totals.add_record(record);
 
         // Records with no model form their own group instead of being dropped
         // from the breakdown.
@@ -168,7 +126,7 @@ pub fn summarize<'a>(
                     .unwrap_or_else(|| "Unknown model".to_string()),
                 totals: UsageTotals::default(),
             });
-        accumulate(&mut group.totals, record);
+        group.totals.add_record(record);
     }
 
     UsageSummary {

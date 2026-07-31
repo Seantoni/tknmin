@@ -23,8 +23,19 @@ export const MINI_WIDTH = 268;
 /** One row per allowance needs the width the stacked panel cannot spare. */
 export const MINI_WIDE_WIDTH = 600;
 
-/** Two stacked blocks side by side, at the width one block already takes. */
-export const MINI_GRID_WIDTH = 530;
+/** One block's width in the grid. Kept in step with `.q-cell` in `App.css`. */
+export const MINI_GRID_CELL = 240;
+
+/** The gap between blocks — and between the outermost ones and the panel's
+ *  edge, which the panel's own padding already is. Kept in step with
+ *  `.q-list.is-grid` and `.mini` in `App.css`. */
+export const MINI_GRID_GAP = 12;
+
+/** The grid is a single row of blocks: one cell each, the gaps between them,
+ *  and the panel's horizontal padding on both ends. */
+export function miniGridWidth(cells: number): number {
+  return Math.max(1, cells) * MINI_GRID_CELL + Math.max(0, cells - 1) * MINI_GRID_GAP + 20;
+}
 
 /** Which interface to mount: the dashboard, or the compact window. */
 export function currentWindowLabel(): string {

@@ -28,8 +28,8 @@
  * is dropped; the lines are only rearranged.
  *
  * The grid layout keeps the stacked block whole and moves the next allowance
- * to its right instead of below: two columns of blocks, each the full
- * three-line story.
+ * to its right instead of below: one row of blocks, each the full three-line
+ * story, the panel widening to fit them all.
  *
  * Both callers pass their own sizing through the surrounding class, so the
  * dashboard can breathe without the design drifting from the panel's.
@@ -84,9 +84,9 @@ export function QuotaRows({ quotas, pace, projections, health, now, layout }: Qu
   const horizontal = layout === "horizontal";
 
   if (layout === "grid") {
-    // Every allowance the same stacked block — name, bar, the numbers — with
-    // the next one to its right rather than below, so two fit across the
-    // wider panel. No headings: the source's name rides inside each block.
+    // Every allowance the same stacked block — name, bar, the numbers — all
+    // of them side by side in one row. No headings: the source's name rides
+    // inside each block.
     return (
       <ul className="q-list is-grid">
         {quotaGroups(quotas).flatMap(({ sourceApp, windows }) => {
@@ -286,7 +286,7 @@ function Row({
   );
 
   const left = (
-    <span className="num q-left">
+    <span className={`num q-left${pace?.state === "red" ? " is-red" : ""}`}>
       {/* The tilde is the whole disclosure at a glance: this number moved
           without the source having said so. */}
       {projection !== undefined && <span className="q-approx">≈</span>}

@@ -20,8 +20,8 @@ use crate::domain::{
     apply_projections, build_baseline, evaluate_pace, fit_calibrations, project_quotas,
     recent_token_rates, QuotaProjection, QuotaSample, RecentQuery, ReplaceScope,
     RepositoryRevision, SourceApp, SourceBaseline, SourceCheckpoint, SourceSyncHealth,
-    SummaryQuery, UsageQuota, UsageRecord, UsageSummary, WindowPace, BASELINE_DAYS,
-    RATE_WINDOW_MINUTES,
+    SummaryQuery, ThreadUsageQuery, ThreadUsageReport, UsageQuota, UsageRecord, UsageSummary,
+    WindowPace, BASELINE_DAYS, RATE_WINDOW_MINUTES,
 };
 
 pub use memory::InMemoryUsageRepository;
@@ -174,6 +174,9 @@ pub struct DashboardSnapshot {
     pub overview: UsageSummary,
     /// Reflects the requested filter.
     pub summary: UsageSummary,
+    /// Per-thread usage under the same filter as `summary`, so a thread's row
+    /// always agrees with the totals beside it.
+    pub thread_usage: ThreadUsageReport,
     pub recent: Vec<UsageRecord>,
     pub record_count: usize,
     /// Exactly what the sources reported, never a derived value. The interface
@@ -198,6 +201,9 @@ pub trait UsageReader: Send + Sync {
     fn summary(&self, query: &SummaryQuery) -> Result<UsageSummary, RepositoryError>;
 
     fn recent(&self, query: &RecentQuery) -> Result<Vec<UsageRecord>, RepositoryError>;
+
+    /// Per-thread usage for one filter: what each conversation consumed.
+    fn thread_usage(&self, query: &ThreadUsageQuery) -> Result<ThreadUsageReport, RepositoryError>;
 
     /// Every record at or after `since`, unfiltered and uncapped.
     ///
@@ -281,6 +287,10 @@ pub(crate) fn assemble_snapshot(
         revision,
         overview: reader.summary(overview_query)?,
         summary: reader.summary(&recent_query.filter)?,
+        thread_usage: reader.thread_usage(&ThreadUsageQuery {
+            filter: recent_query.filter.clone(),
+            limit: ThreadUsageQuery::DEFAULT_LIMIT,
+        })?,
         recent: reader.recent(recent_query)?,
         record_count: reader.count()?,
         quotas,
@@ -666,6 +676,14 @@ mod tests {
         fn recent(&self, query: &RecentQuery) -> Result<Vec<UsageRecord>, RepositoryError> {
             self.assert_revision_was_read();
             self.inner.recent(query)
+        }
+
+        fn thread_usage(
+            &self,
+            query: &ThreadUsageQuery,
+        ) -> Result<ThreadUsageReport, RepositoryError> {
+            self.assert_revision_was_read();
+            self.inner.thread_usage(query)
         }
 
         fn records_since(&self, since: DateTime<Utc>) -> Result<Vec<UsageRecord>, RepositoryError> {
