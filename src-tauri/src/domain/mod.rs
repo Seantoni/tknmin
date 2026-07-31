@@ -28,7 +28,7 @@ pub use money::{Money, MoneyError};
 pub use notifications::{
     evaluate_alerts, live_alert_keys, AlertAction, ThresholdAlert, HANDOFF_PROMPT,
 };
-pub use options::{AppOptions, OptionsError, SourceThreshold, ThresholdMetric};
+pub use options::{AppOptions, MiniLayout, OptionsError, SourceThreshold, ThresholdMetric};
 pub use pace::{evaluate_pace, PaceBasis, PaceState, QuotaSample, WindowPace};
 pub use projection::{
     apply_projections, cost_units, fit_calibrations, project_quotas, QuotaCalibration,

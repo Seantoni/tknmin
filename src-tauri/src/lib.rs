@@ -45,6 +45,10 @@ use state::AppState;
 /// The one event the interface listens to for data changes.
 pub const DATA_CHANGED_EVENT: &str = "data-changed";
 
+/// Emitted after options are committed, so every window holding its own copy
+/// can follow the save instead of writing a stale one back later.
+pub const OPTIONS_CHANGED_EVENT: &str = "options-changed";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()

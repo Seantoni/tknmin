@@ -9,7 +9,8 @@
  * about Cursor read as Cursor's two pools rather than as two separate tools. A
  * source with a single window needs no such heading and gets one row.
  *
- * A row is always two lines around one bar, whatever the sources report:
+ * A stacked row is always two lines around one bar, whatever the sources
+ * report:
  *
  * ```text
  * ● codex  week                31% left
@@ -21,6 +22,10 @@
  * line is the only thing position cannot say: whether the current pace reaches
  * the reset, and when that reset is. The two sit side by side deliberately —
  * the gap between them is the whole point.
+ *
+ * The horizontal layout says the same on a single line — name, bar, position,
+ * pace, reset left to right — for the compact window's one-row mode. Nothing
+ * is dropped; the lines are only rearranged.
  *
  * Both callers pass their own sizing through the surrounding class, so the
  * dashboard can breathe without the design drifting from the panel's.
@@ -61,11 +66,18 @@ interface QuotaRowsProps {
   health: SourceSyncHealth[];
   /** Ticking clock, so ages and countdowns in the tooltips stay live. */
   now: Date;
+  /**
+   * "stacked" is two lines around a bar per allowance; "horizontal" puts the
+   * name, the bar, and every number on a single row. The compact window
+   * chooses; the dashboard leaves the default alone.
+   */
+  layout?: "stacked" | "horizontal";
 }
 
-export function QuotaRows({ quotas, pace, projections, health, now }: QuotaRowsProps) {
+export function QuotaRows({ quotas, pace, projections, health, now, layout }: QuotaRowsProps) {
+  const horizontal = layout === "horizontal";
   return (
-    <ul className="q-list">
+    <ul className={horizontal ? "q-list is-horizontal" : "q-list"}>
       {quotaGroups(quotas).map(({ sourceApp, windows }) => {
         // One line of freshness per source, because a percentage with no age is
         // indistinguishable from a percentage that stopped updating an hour ago.
@@ -84,16 +96,18 @@ export function QuotaRows({ quotas, pace, projections, health, now }: QuotaRowsP
                 projection={projectionForQuota(projections, windows[0])}
                 now={now}
                 name={SOURCE_LABEL[sourceApp]}
+                windowTag={quotaWindowTag(windows[0].windowMinutes)}
                 withDot
+                horizontal={horizontal}
               />
-            ) : (
-              <>
-                <p className="q-source">
-                  <span className="dot" style={{ background: SOURCE_COLOR[sourceApp] }} />
-                  {SOURCE_LABEL[sourceApp]}
-                </p>
-                <ul className="q-pools">
-                  {windows.map((quota) => (
+            ) : horizontal ? (
+              // No heading to nest under here: the source's name rides inside
+              // each of its rows, so every pool is still one complete row.
+              <ul className="q-pools is-horizontal">
+                {windows.map((quota) => {
+                  const pool = poolName(quota, sourceApp);
+                  const tag = quotaWindowTag(quota.windowMinutes);
+                  return (
                     <li key={quotaRowKey(quota)}>
                       <Row
                         quota={quota}
@@ -101,10 +115,39 @@ export function QuotaRows({ quotas, pace, projections, health, now }: QuotaRowsP
                         pace={paceForQuota(pace, quota)}
                         projection={projectionForQuota(projections, quota)}
                         now={now}
-                        name={poolName(quota, sourceApp)}
+                        name={`${SOURCE_LABEL[sourceApp]} ${pool}`}
+                        windowTag={pool === tag ? null : tag}
+                        withDot
+                        horizontal
                       />
                     </li>
-                  ))}
+                  );
+                })}
+              </ul>
+            ) : (
+              <>
+                <p className="q-source">
+                  <span className="dot" style={{ background: SOURCE_COLOR[sourceApp] }} />
+                  {SOURCE_LABEL[sourceApp]}
+                </p>
+                <ul className="q-pools">
+                  {windows.map((quota) => {
+                    const pool = poolName(quota, sourceApp);
+                    const tag = quotaWindowTag(quota.windowMinutes);
+                    return (
+                      <li key={quotaRowKey(quota)}>
+                        <Row
+                          quota={quota}
+                          quotas={quotas}
+                          pace={paceForQuota(pace, quota)}
+                          projection={projectionForQuota(projections, quota)}
+                          now={now}
+                          name={pool}
+                          windowTag={pool === tag ? null : tag}
+                        />
+                      </li>
+                    );
+                  })}
                 </ul>
               </>
             )}
@@ -122,7 +165,11 @@ export function QuotaRows({ quotas, pace, projections, health, now }: QuotaRowsP
 
 /**
  * The dot marks a source, so a row standing in for a whole source carries one
- * and a pool nested under a heading does not — its heading already did.
+ * and a pool nested under a heading does not — its heading already did. In the
+ * horizontal layout there is no heading, so every row carries its dot.
+ *
+ * `windowTag` is null when the name already says the window ("claude code 5h"
+ * needs no second "5h").
  */
 function Row({
   quota,
@@ -131,7 +178,9 @@ function Row({
   projection,
   now,
   name,
+  windowTag,
   withDot = false,
+  horizontal = false,
 }: {
   quota: UsageQuota;
   quotas: UsageQuota[];
@@ -139,9 +188,10 @@ function Row({
   projection: QuotaProjection | undefined;
   now: Date;
   name: string;
+  windowTag: string | null;
   withDot?: boolean;
+  horizontal?: boolean;
 }) {
-  const tag = quotaWindowTag(quota.windowMinutes);
   const verdict = pace === undefined ? null : describePaceCompact(pace);
   const gap = pace === undefined ? null : describePaceGap(pace);
   const evenPace = quotaEvenPacePercent(quota, now);
@@ -164,42 +214,69 @@ function Row({
   const confirmedPercent = Math.min(100, quota.usedPercentTenths / 10);
   const projectedPercent = Math.min(100, quotaUsedTenths(quota, projection) / 10);
 
+  const bar = (
+    <span className="q-bar">
+      {projection !== undefined && (
+        <span
+          className="q-bar-fill is-projected"
+          style={{
+            width: `${projectedPercent}%`,
+            background: SOURCE_COLOR[quota.sourceApp],
+          }}
+        />
+      )}
+      <span
+        className="q-bar-fill"
+        style={{
+          width: `${confirmedPercent}%`,
+          background: SOURCE_COLOR[quota.sourceApp],
+        }}
+      />
+      {/* Where even spending would have reached by now. The fill's position
+          against this mark is the whole judgement, drawn rather than worded. */}
+      {evenPace !== null && <span className="q-bar-target" style={{ left: `${evenPace}%` }} />}
+    </span>
+  );
+
+  const left = (
+    <span className="num q-left">
+      {/* The tilde is the whole disclosure at a glance: this number moved
+          without the source having said so. */}
+      {projection !== undefined && <span className="q-approx">≈</span>}
+      {formatPercentTenths(quotaLiveRemainingTenths(quota, projection))} left
+    </span>
+  );
+
+  if (horizontal) {
+    // Everything the stacked row says on three lines, said on one: identity
+    // left, the bar stretching over whatever width is left, then the numbers.
+    return (
+      <div className="q-row is-horizontal" title={tooltip}>
+        <span className="q-line">
+          {withDot && (
+            <span className="dot" style={{ background: SOURCE_COLOR[quota.sourceApp] }} />
+          )}
+          <span className="q-name">{name}</span>
+          {windowTag !== null && <span className="q-window">{windowTag}</span>}
+          {bar}
+          {left}
+          {verdict !== null && <span className={`q-verdict is-${pace?.state}`}>{verdict}</span>}
+          {gap !== null && <span className="q-gap">· {gap}</span>}
+          <span className="num q-reset">{describeQuotaResetCompact(quota.resetsAt)}</span>
+        </span>
+      </div>
+    );
+  }
+
   return (
     <div className="q-row" title={tooltip}>
       <span className="q-line">
         {withDot && <span className="dot" style={{ background: SOURCE_COLOR[quota.sourceApp] }} />}
         <span className="q-name">{name}</span>
-        {name !== tag && <span className="q-window">{tag}</span>}
-        <span className="num q-left">
-          {/* The tilde is the whole disclosure at a glance: this number moved
-              without the source having said so. */}
-          {projection !== undefined && <span className="q-approx">≈</span>}
-          {formatPercentTenths(quotaLiveRemainingTenths(quota, projection))} left
-        </span>
+        {windowTag !== null && <span className="q-window">{windowTag}</span>}
+        {left}
       </span>
-      <span className="q-bar">
-        {projection !== undefined && (
-          <span
-            className="q-bar-fill is-projected"
-            style={{
-              width: `${projectedPercent}%`,
-              background: SOURCE_COLOR[quota.sourceApp],
-            }}
-          />
-        )}
-        <span
-          className="q-bar-fill"
-          style={{
-            width: `${confirmedPercent}%`,
-            background: SOURCE_COLOR[quota.sourceApp],
-          }}
-        />
-        {/* Where even spending would have reached by now. The fill's position
-            against this mark is the whole judgement, drawn rather than worded. */}
-        {evenPace !== null && (
-          <span className="q-bar-target" style={{ left: `${evenPace}%` }} />
-        )}
-      </span>
+      {bar}
       <span className="q-line q-detail">
         {verdict !== null && <span className={`q-verdict is-${pace?.state}`}>{verdict}</span>}
         {gap !== null && <span className="q-gap">· {gap}</span>}

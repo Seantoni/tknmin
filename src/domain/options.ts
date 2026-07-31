@@ -21,10 +21,15 @@ export interface SourceThreshold {
   value: number;
 }
 
+/** How the compact window lays its allowance rows out. */
+export type MiniLayout = "stacked" | "horizontal";
+
 export interface AppOptions {
   thresholds: SourceThreshold[];
   /** Whether the compact window floats above other applications. */
   miniAlwaysOnTop: boolean;
+  /** Whether the compact window stacks its rows or puts each on one line. */
+  miniLayout: MiniLayout;
 }
 
 export const THRESHOLD_METRICS: readonly ThresholdMetric[] = [
@@ -49,6 +54,7 @@ export function defaultOptions(): AppOptions {
       value: DEFAULT_THRESHOLD_VALUE.remaining_percent,
     })),
     miniAlwaysOnTop: true,
+    miniLayout: "stacked",
   };
 }
 

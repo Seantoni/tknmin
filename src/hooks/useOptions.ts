@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 
-import { fetchOptions, saveOptions } from "../api/options";
+import { fetchOptions, saveOptions, OPTIONS_CHANGED } from "../api/options";
 import type { AppOptions } from "../domain/options";
 import { defaultOptions } from "../domain/options";
 import type { AppError } from "../domain/usage";
@@ -30,6 +31,27 @@ export function useOptions() {
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  // The compact window saves options too; without this its save would arrive
+  // here only after this window had already written its older copy back.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+
+    void listen<AppOptions>(OPTIONS_CHANGED, (event) => {
+      if (cancelled) return;
+      setOptions(event.payload);
+      setStatus("ready");
+    }).then((off) => {
+      if (cancelled) off();
+      else unlisten = off;
+    });
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   const update = useCallback(async (next: AppOptions) => {
     setOptions(next);

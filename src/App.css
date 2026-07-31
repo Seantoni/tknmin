@@ -956,6 +956,12 @@ button.strip-row:hover {
   gap: 8px;
 }
 
+.mini-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .mini-brand {
   font-size: 11px;
   font-weight: 600;
@@ -1197,6 +1203,42 @@ button.strip-row:hover {
 
 .allowances .q-bar {
   height: 3px;
+}
+
+/* The compact window's one-row mode: the same facts the stacked row spreads
+ * over three lines, flown left to right on one. The bar takes whatever width
+ * the words leave, so every row ends flush at the reset time. */
+.q-list.is-horizontal {
+  gap: 7px;
+}
+
+/* No heading, no rail: the source's name rides inside each of its rows. */
+.q-pools.is-horizontal {
+  margin: 0;
+  padding: 0;
+  border-left: none;
+  gap: 7px;
+}
+
+.q-row.is-horizontal .q-line {
+  gap: 8px;
+}
+
+.q-row.is-horizontal .q-bar {
+  flex: 1 1 40px;
+  min-width: 0;
+}
+
+/* The numbers follow the bar directly; nothing is pushed to an edge, because
+   the bar has already absorbed the slack. */
+.q-row.is-horizontal .q-left,
+.q-row.is-horizontal .q-reset {
+  margin-left: 0;
+}
+
+.q-row.is-horizontal .q-verdict,
+.q-row.is-horizontal .q-gap {
+  font-size: 10px;
 }
 
 .mini-empty {

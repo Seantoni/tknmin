@@ -18,7 +18,10 @@ const COMMANDS = {
 } as const;
 
 /** Kept in step with `MINI_WIDTH` in `src-tauri/src/mini.rs`. */
-const MINI_WIDTH = 268;
+export const MINI_WIDTH = 268;
+
+/** One row per allowance needs the width the stacked panel cannot spare. */
+export const MINI_WIDE_WIDTH = 600;
 
 /** Which interface to mount: the dashboard, or the compact window. */
 export function currentWindowLabel(): string {
@@ -33,9 +36,11 @@ export function showDashboardWindow(): Promise<void> {
   return call(COMMANDS.showDashboard);
 }
 
-/** Make the compact window exactly as tall as what it is showing. */
-export async function fitMiniWindowHeight(height: number): Promise<void> {
-  await getCurrentWindow().setSize(new LogicalSize(MINI_WIDTH, height));
+/** Make the compact window exactly as tall as what it is showing, and as
+ *  wide as the layout asks for: the content decides the height, the layout
+ *  decides the width. */
+export async function fitMiniWindowSize(width: number, height: number): Promise<void> {
+  await getCurrentWindow().setSize(new LogicalSize(width, height));
 }
 
 async function call(command: string): Promise<void> {

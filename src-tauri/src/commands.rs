@@ -7,7 +7,7 @@
 //! which is what makes the interface's freshness independent of which command
 //! happened to run last.
 
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::adapters::cursor::CursorConnectionStatus;
 use crate::adapters::{self, AdapterInfo};
@@ -132,6 +132,9 @@ pub fn set_options(
     prefs::save_options(&path, &options)?;
     state.replace_options(options.clone());
     crate::mini::set_always_on_top(&app, options.mini_always_on_top);
+    // Both windows hold their own copy of the options; a save here has to
+    // reach the other one, or its next save would write the stale copy back.
+    let _ = app.emit(crate::OPTIONS_CHANGED_EVENT, &options);
     // A moved threshold can cross on quotas that have not changed at all, so
     // this re-evaluates the committed ones. It reads no source.
     crate::alerts::evaluate_and_notify(&app);

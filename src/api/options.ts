@@ -12,6 +12,9 @@ const COMMANDS = {
   setOptions: "set_options",
 } as const;
 
+/** Emitted after a save commits, so every window follows the same options. */
+export const OPTIONS_CHANGED = "options-changed";
+
 export function fetchOptions(): Promise<AppOptions> {
   return call<AppOptions>(COMMANDS.getOptions);
 }

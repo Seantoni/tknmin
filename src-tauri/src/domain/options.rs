@@ -30,6 +30,17 @@ impl ThresholdMetric {
     ];
 }
 
+/// How the compact window lays its allowance rows out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MiniLayout {
+    /// Two lines around a bar per allowance, stacked down the panel.
+    #[default]
+    Stacked,
+    /// Every fact about one allowance on a single horizontal row.
+    Horizontal,
+}
+
 /// One source's alert threshold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +62,10 @@ pub struct AppOptions {
     /// on deserialize so an options file written before this existed loads.
     #[serde(default = "always_on_top_default")]
     pub mini_always_on_top: bool,
+    /// How the compact window lays out its rows. Defaulted on deserialize so
+    /// an options file written before this existed loads.
+    #[serde(default)]
+    pub mini_layout: MiniLayout,
 }
 
 /// The compact window exists to stay visible next to an editor, so floating is
@@ -73,6 +88,7 @@ impl AppOptions {
                 })
                 .collect(),
             mini_always_on_top: always_on_top_default(),
+            mini_layout: MiniLayout::default(),
         }
     }
 
@@ -224,6 +240,7 @@ mod tests {
         assert!(json.contains("\"sourceApp\""));
         assert!(json.contains("\"remaining_percent\""));
         assert!(json.contains("\"miniAlwaysOnTop\""));
+        assert!(json.contains("\"miniLayout\""));
         let back: AppOptions = serde_json::from_str(&json).unwrap();
         assert_eq!(back, AppOptions::defaults());
     }
@@ -233,5 +250,6 @@ mod tests {
         let json = r#"{"thresholds":[]}"#;
         let loaded: AppOptions = serde_json::from_str(json).unwrap();
         assert!(loaded.mini_always_on_top);
+        assert_eq!(loaded.mini_layout, MiniLayout::Stacked);
     }
 }
