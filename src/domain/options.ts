@@ -22,7 +22,7 @@ export interface SourceThreshold {
 }
 
 /** How the compact window lays its allowance rows out. */
-export type MiniLayout = "stacked" | "horizontal";
+export type MiniLayout = "stacked" | "horizontal" | "grid";
 
 export interface AppOptions {
   thresholds: SourceThreshold[];

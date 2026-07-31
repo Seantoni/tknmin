@@ -27,6 +27,10 @@
  * pace, reset left to right — for the compact window's one-row mode. Nothing
  * is dropped; the lines are only rearranged.
  *
+ * The grid layout keeps the stacked block whole and moves the next allowance
+ * to its right instead of below: two columns of blocks, each the full
+ * three-line story.
+ *
  * Both callers pass their own sizing through the surrounding class, so the
  * dashboard can breathe without the design drifting from the panel's.
  */
@@ -51,6 +55,7 @@ import {
   quotaWindowTag,
 } from "../format";
 import { SOURCE_COLOR, SOURCE_LABEL } from "../theme";
+import type { MiniLayout } from "../domain/options";
 import type { QuotaProjection, WindowPace } from "../domain/pace";
 import type { SourceApp, SourceSyncHealth, UsageQuota } from "../domain/usage";
 
@@ -68,14 +73,56 @@ interface QuotaRowsProps {
   now: Date;
   /**
    * "stacked" is two lines around a bar per allowance; "horizontal" puts the
-   * name, the bar, and every number on a single row. The compact window
+   * name, the bar, and every number on a single row; "grid" keeps the stacked
+   * block and puts the next allowance to its right. The compact window
    * chooses; the dashboard leaves the default alone.
    */
-  layout?: "stacked" | "horizontal";
+  layout?: MiniLayout;
 }
 
 export function QuotaRows({ quotas, pace, projections, health, now, layout }: QuotaRowsProps) {
   const horizontal = layout === "horizontal";
+
+  if (layout === "grid") {
+    // Every allowance the same stacked block — name, bar, the numbers — with
+    // the next one to its right rather than below, so two fit across the
+    // wider panel. No headings: the source's name rides inside each block.
+    return (
+      <ul className="q-list is-grid">
+        {quotaGroups(quotas).flatMap(({ sourceApp, windows }) => {
+          const sourceHealth = health.find((each) => each.sourceApp === sourceApp);
+          const freshness =
+            sourceHealth === undefined ? undefined : describeSourceFreshness(sourceHealth);
+          return windows.map((quota, index) => {
+            const pool = windows.length === 1 ? null : poolName(quota, sourceApp);
+            const tag = quotaWindowTag(quota.windowMinutes);
+            return (
+              <li key={quotaRowKey(quota)} className="q-cell" title={freshness}>
+                <Row
+                  quota={quota}
+                  quotas={quotas}
+                  pace={paceForQuota(pace, quota)}
+                  projection={projectionForQuota(projections, quota)}
+                  now={now}
+                  name={
+                    pool === null
+                      ? SOURCE_LABEL[sourceApp]
+                      : `${SOURCE_LABEL[sourceApp]} ${pool}`
+                  }
+                  windowTag={pool === null ? tag : pool === tag ? null : tag}
+                  withDot
+                />
+                {index === windows.length - 1 && sourceHealth?.awaitingUpstream === true && (
+                  <p className="q-note">activity detected · awaiting billing data</p>
+                )}
+              </li>
+            );
+          });
+        })}
+      </ul>
+    );
+  }
+
   return (
     <ul className={horizontal ? "q-list is-horizontal" : "q-list"}>
       {quotaGroups(quotas).map(({ sourceApp, windows }) => {

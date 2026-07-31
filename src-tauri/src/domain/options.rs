@@ -39,6 +39,8 @@ pub enum MiniLayout {
     Stacked,
     /// Every fact about one allowance on a single horizontal row.
     Horizontal,
+    /// The stacked block, two across: the next allowance sits to the right.
+    Grid,
 }
 
 /// One source's alert threshold.

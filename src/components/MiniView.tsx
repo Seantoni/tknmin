@@ -5,10 +5,11 @@
  * click away for the rest.
  *
  * The rows themselves are [`QuotaRows`], shared with the dashboard so the two
- * cannot drift apart, in either of two layouts the user picks here: stacked,
- * two lines around a bar in a narrow panel, or horizontal, one complete row
- * per allowance in a wide one. What belongs to this file is the panel: its
- * chrome, its drag region, its layout toggle, and its size.
+ * cannot drift apart, in one of three layouts the user cycles through here:
+ * stacked, two lines around a bar in a narrow panel; horizontal, one complete
+ * row per allowance in a wide one; or grid, the stacked block two across.
+ * What belongs to this file is the panel: its chrome, its drag region, its
+ * layout toggle, and its size.
  *
  * How tall the panel is depends on what the sources report — and they differ
  * by plan — so the window is sized from the rendered content rather than
@@ -24,11 +25,43 @@ import {
   showDashboardWindow,
   MINI_WIDTH,
   MINI_WIDE_WIDTH,
+  MINI_GRID_WIDTH,
 } from "../api/window";
 import type { AppOptions, MiniLayout } from "../domain/options";
 import { QuotaRows } from "./QuotaRows";
 import { useQuotas } from "../hooks/useQuotas";
 import { useNow } from "../hooks/useNow";
+
+/** The toggle walks this ring, one layout per press: what the button
+ *  promises next, and what the window becomes. */
+const NEXT: Record<MiniLayout, { layout: MiniLayout; label: string; title: string }> = {
+  stacked: {
+    layout: "horizontal",
+    label: "one row",
+    title: "each allowance on one horizontal row",
+  },
+  horizontal: {
+    layout: "grid",
+    label: "grid",
+    title: "the stacked blocks, two across",
+  },
+  grid: {
+    layout: "stacked",
+    label: "stacked",
+    title: "back to stacked rows",
+  },
+};
+
+function widthFor(layout: MiniLayout): number {
+  switch (layout) {
+    case "horizontal":
+      return MINI_WIDE_WIDTH;
+    case "grid":
+      return MINI_GRID_WIDTH;
+    case "stacked":
+      return MINI_WIDTH;
+  }
+}
 
 export function MiniView() {
   const { status, quotas, pace, projections, health, error } = useQuotas();
@@ -72,7 +105,7 @@ export function MiniView() {
     const element = panel.current;
     if (element === null) return;
 
-    const width = layout === "horizontal" ? MINI_WIDE_WIDTH : MINI_WIDTH;
+    const width = widthFor(layout);
     const fit = () => {
       const height = Math.ceil(element.getBoundingClientRect().height);
       if (height > 0) void fitMiniWindowSize(width, height);
@@ -85,7 +118,7 @@ export function MiniView() {
   }, [layout]);
 
   const toggleLayout = () => {
-    const next: MiniLayout = layout === "stacked" ? "horizontal" : "stacked";
+    const next = NEXT[layout].layout;
     setLayout(next);
     // Read-then-write, so the rest of the options survive even if another
     // window moved them since this one loaded.
@@ -108,14 +141,10 @@ export function MiniView() {
           <button
             type="button"
             className="ghost small"
-            title={
-              layout === "stacked"
-                ? "each allowance on one horizontal row"
-                : "back to stacked rows"
-            }
+            title={NEXT[layout].title}
             onClick={toggleLayout}
           >
-            {layout === "stacked" ? "one row" : "stacked"}
+            {NEXT[layout].label}
           </button>
           <button
             type="button"

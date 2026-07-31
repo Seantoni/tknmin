@@ -23,6 +23,9 @@ export const MINI_WIDTH = 268;
 /** One row per allowance needs the width the stacked panel cannot spare. */
 export const MINI_WIDE_WIDTH = 600;
 
+/** Two stacked blocks side by side, at the width one block already takes. */
+export const MINI_GRID_WIDTH = 530;
+
 /** Which interface to mount: the dashboard, or the compact window. */
 export function currentWindowLabel(): string {
   return getCurrentWindow().label;

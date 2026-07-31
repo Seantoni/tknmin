@@ -1241,6 +1241,24 @@ button.strip-row:hover {
   font-size: 10px;
 }
 
+/* The grid mode: the stacked block, two across. Each cell is exactly the
+ * block the narrow panel shows; the window is simply wide enough for the
+ * next one to sit beside it instead of below. */
+.q-list.is-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+/* Grid items default to their content's width, which would let a long name
+ * push the cell past its column; floor at zero so it ellipsizes instead. */
+.q-cell {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .mini-empty {
   margin: auto 0;
   text-align: center;
