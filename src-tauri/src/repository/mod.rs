@@ -292,7 +292,13 @@ pub(crate) fn assemble_snapshot(
 
 /// How far back samples are kept for pace measurement: the longest window in
 /// use is a monthly billing cycle, plus margin.
-const SAMPLE_HORIZON_DAYS: i64 = 62;
+///
+/// Public because the coordinator prunes against it. Pruning to anything
+/// shorter than this silently caps what the calibration in
+/// [`crate::domain::projection`] can ever see, and a monthly window whose
+/// history is trimmed to a week can never accumulate enough movement to be
+/// fitted — the horizon and the prune have to be the same number.
+pub const SAMPLE_HORIZON_DAYS: i64 = 62;
 
 /// Every live window's pace, from quotas already read at this revision.
 ///

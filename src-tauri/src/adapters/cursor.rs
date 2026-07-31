@@ -268,13 +268,22 @@ impl CursorAdapter {
             .header("Connect-Protocol-Version", "1")
             .json(&serde_json::json!({}))
             .send()
-            .map_err(|error| quota_error(format!("Cursor usage request failed: {error}")))?;
+            .map_err(|error| {
+                // "Cannot reach" is not "is broken": the interface should say
+                // offline, keep the last-good percentage, and the coordinator
+                // should back off rather than retry at the polling interval.
+                if error.is_timeout() || error.is_connect() {
+                    AdapterError::Offline {
+                        adapter: Self::ID,
+                        reason: "Cursor could not be reached".to_string(),
+                    }
+                } else {
+                    quota_error("the Cursor usage request failed".to_string())
+                }
+            })?;
 
         if !response.status().is_success() {
-            return Err(quota_error(format!(
-                "Cursor usage request returned HTTP {}",
-                response.status()
-            )));
+            return Err(classify_quota_status(&response));
         }
 
         let value: serde_json::Value = response
@@ -422,15 +431,46 @@ pub struct LocalCheckpoint {
     pub modified_ms: Option<i64>,
 }
 
-/// Checkpoint keys. Two, because local and dashboard are different datasets
-/// over the same source and must never resume from each other's position.
+/// Where the live-activity read has got to.
+///
+/// A rowid rather than a timestamp, because it is the only handle on this
+/// table that answers "what is new" without reading the table. Bubbles are
+/// inserted with increasing rowids, so a watermark turns the scan into an
+/// index range over exactly the new rows — which is what makes it affordable
+/// to run this every few seconds against a database that can reach gigabytes.
+///
+/// The cost of that choice, stated plainly: a bubble *rewritten* in place
+/// keeps its rowid and is not seen again here. That is deliberate. This read
+/// exists to notice that a request happened, and the dashboard — which does
+/// re-read its window — remains the only thing that says what one cost.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveCheckpoint {
+    /// `None` before the first read, which seeds it without emitting anything.
+    #[serde(default)]
+    pub max_rowid: Option<i64>,
+}
+
+/// Checkpoint keys. Three, because the local, live and dashboard reads are
+/// different datasets over the same source and must never resume from each
+/// other's position.
 const LOCAL_CHECKPOINT: &str = "local-bubbles";
 const DASHBOARD_CHECKPOINT: &str = "dashboard-window";
+const LIVE_CHECKPOINT: &str = "local-activity";
+
+/// The dataset the live read owns. Separate from [`SOURCE_REF`] so a replace
+/// scope can name one without touching the other.
+const LIVE_SOURCE_REF: &str = "local-activity";
 
 /// How far before the watermark a fast delta re-reads. Cursor publishes billed
 /// events out of order and corrects them, so a window that only looked forward
 /// would miss both.
 const DELTA_OVERLAP: chrono::Duration = chrono::Duration::hours(6);
+
+/// The oldest a bubble may be and still become a live placeholder. Anything
+/// further back is either already billed or never will be, and in both cases
+/// the dashboard is the better answer.
+const LIVE_ACTIVITY_WINDOW: chrono::Duration = chrono::Duration::hours(6);
 
 impl SourceAdapter for CursorAdapter {
     fn id(&self) -> &'static str {
@@ -472,11 +512,37 @@ impl SourceAdapter for CursorAdapter {
         }
 
         if self.allow_dashboard && dashboard_token()?.is_some() {
-            self.read_dashboard_delta(request)
+            let mut delta = self.read_dashboard_delta(request)?;
+            // The billed feed is authoritative but late; the local database is
+            // immediate but says nothing about cost. Reading both is what lets
+            // a request appear the moment it is made and acquire its price
+            // when billing catches up, instead of not existing until then.
+            //
+            // Its failure is not the job's failure. A missing placeholder
+            // costs latency on a row that was going to arrive anyway, and
+            // failing the whole read over it would throw away the authoritative
+            // numbers that did arrive.
+            match self.read_live_activity(request) {
+                Ok(live) => merge_live_into(&mut delta, live),
+                Err(error) => delta.failures.push(format!("live activity: {error}")),
+            }
+            Ok(delta)
         } else {
             self.read_local_delta(request)
         }
     }
+}
+
+/// Fold the live read's drafts and checkpoint into the dashboard's delta.
+///
+/// Only these two fields cross over. The live read states no quota, no
+/// freshness and no upstream verdict — it can see that a request happened, not
+/// what any of them are worth — so letting it contribute to those would be
+/// letting a placeholder speak for the source.
+fn merge_live_into(delta: &mut SourceDelta, live: SourceDelta) {
+    delta.drafts.extend(live.drafts);
+    delta.checkpoints.extend(live.checkpoints);
+    delta.failures.extend(live.failures);
 }
 
 impl CursorAdapter {
@@ -518,14 +584,35 @@ impl CursorAdapter {
             .local_activity_at()
             .is_some_and(|activity| newest.is_none_or(|published| activity > published));
 
+        // Every placeholder before the newest published event has been
+        // superseded by the real thing, so it is retired in the same
+        // transaction that lands its replacement — the live row never
+        // outlives the billed one, and the two never show side by side.
+        // Placeholders after that instant are exactly the ones still waiting,
+        // which is the whole reason they exist.
+        let retire_live = newest.map(|published_through| ReplaceScope {
+            source_app: SourceApp::Cursor,
+            adapter_id: Self::ID.to_string(),
+            source_ref: Some(LIVE_SOURCE_REF.to_string()),
+            from: full_window,
+            until: published_through,
+        });
+
         Ok(SourceDelta {
             drafts,
-            replace_scopes: vec![ReplaceScope {
-                source_app: SourceApp::Cursor,
-                adapter_id: Self::ID.to_string(),
-                from,
-                until: request.now,
-            }],
+            replace_scopes: [
+                Some(ReplaceScope {
+                    source_app: SourceApp::Cursor,
+                    adapter_id: Self::ID.to_string(),
+                    source_ref: Some(DASHBOARD_SOURCE_REF.to_string()),
+                    from,
+                    until: request.now,
+                }),
+                retire_live,
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
             checkpoints: vec![SourceCheckpoint {
                 adapter_id: Self::ID.to_string(),
                 source_key: DASHBOARD_CHECKPOINT.to_string(),
@@ -539,6 +626,73 @@ impl CursorAdapter {
             }],
             source_observed_at: newest,
             awaiting_upstream,
+            ..SourceDelta::default()
+        })
+    }
+
+    /// The live path: what has happened locally since the last look.
+    ///
+    /// This runs beside the dashboard read, not instead of it, and answers a
+    /// deliberately smaller question: *has a request just been made*. It
+    /// invents no tokens and no cost — modern bubbles carry neither — so every
+    /// row it produces is a placeholder that says a request exists and leaves
+    /// its price unknown until the billed feed supplies one.
+    ///
+    /// Cost is why this is a watermarked read rather than the full scan the
+    /// fallback path does: at the cadence a burst now earns, re-reading a
+    /// database that can reach gigabytes would cost more than the latency it
+    /// buys. New rows only, from a rowid the last read recorded.
+    fn read_live_activity(&self, request: &DeltaRequest) -> Result<SourceDelta, AdapterError> {
+        // No local database is not a failed read. An account can be reachable
+        // from a machine where the editor is not installed, and reporting that
+        // as a failure once per poll would fill the log with a fact that is
+        // not going to change.
+        if !self.db_path.is_file() {
+            return Ok(SourceDelta::default());
+        }
+
+        let stored: LiveCheckpoint = request.resume(LIVE_CHECKPOINT).unwrap_or_default();
+        let connection = self.open_db()?;
+
+        let checkpoint = |max_rowid: Option<i64>| SourceCheckpoint {
+            adapter_id: Self::ID.to_string(),
+            source_key: LIVE_CHECKPOINT.to_string(),
+            payload: serde_json::to_value(LiveCheckpoint { max_rowid }).unwrap_or_default(),
+        };
+
+        // First sight of this database. Finding where "new" starts is one
+        // index lookup; treating everything already there as new would emit a
+        // placeholder for every request the account has ever made, all of them
+        // long since billed.
+        let Some(watermark) = stored.max_rowid else {
+            let highest = highest_bubble_rowid(&connection)?;
+            return Ok(SourceDelta {
+                checkpoints: vec![checkpoint(Some(highest))],
+                ..SourceDelta::default()
+            });
+        };
+
+        let (bubbles, highest) = bubbles_after(&connection, watermark)?;
+        let cutoff = request.now - LIVE_ACTIVITY_WINDOW;
+        let drafts = bubbles
+            .iter()
+            // One placeholder per user turn. A turn is what a request is, and
+            // the assistant bubbles that follow it are the same request being
+            // answered — counting those too would show one question as four.
+            .filter(|bubble| bubble.is_user())
+            .filter(|bubble| {
+                parse_event_instant(&bubble.created_at).is_some_and(|at| at >= cutoff)
+            })
+            .map(|bubble| live_draft(self, bubble))
+            .collect();
+
+        Ok(SourceDelta {
+            drafts,
+            // No replace scope. These rows are retired by the dashboard read
+            // as billing publishes past them, and a scope here would delete
+            // the placeholders of every earlier poll — which are precisely the
+            // ones still waiting for a price.
+            checkpoints: vec![checkpoint(Some(highest.max(watermark)))],
             ..SourceDelta::default()
         })
     }
@@ -591,13 +745,30 @@ impl CursorAdapter {
 
         Ok(SourceDelta {
             replace_scopes: from
-                .map(|from| ReplaceScope {
-                    source_app: SourceApp::Cursor,
-                    adapter_id: Self::ID.to_string(),
-                    from,
-                    until: request.now,
+                .map(|from| {
+                    [
+                        ReplaceScope {
+                            source_app: SourceApp::Cursor,
+                            adapter_id: Self::ID.to_string(),
+                            source_ref: Some(SOURCE_REF.to_string()),
+                            from,
+                            until: request.now,
+                        },
+                        // Reaching this path at all means the dashboard is not
+                        // connected, so this read is now the whole truth about
+                        // Cursor. Placeholders left over from when it was not
+                        // have nothing left to wait for.
+                        ReplaceScope {
+                            source_app: SourceApp::Cursor,
+                            adapter_id: Self::ID.to_string(),
+                            source_ref: Some(LIVE_SOURCE_REF.to_string()),
+                            from,
+                            until: request.now,
+                        },
+                    ]
                 })
                 .into_iter()
+                .flatten()
                 .collect(),
             drafts,
             checkpoints: vec![SourceCheckpoint {
@@ -764,6 +935,40 @@ fn quota_error(reason: String) -> AdapterError {
         adapter: CursorAdapter::ID,
         reason,
     }
+}
+
+/// What an unsuccessful status from the account endpoint means.
+///
+/// Mapping every non-2xx to "unreadable" is what let a rate limit be answered
+/// by asking again on the very next interval: only `Offline` and `RateLimited`
+/// earn the coordinator's backoff, so a 429 replied to as "broken" is a 429
+/// replied to as fast as the poll allows. That mattered less at one poll a
+/// minute than it does at the interval a burst now earns.
+fn classify_quota_status(response: &reqwest::blocking::Response) -> AdapterError {
+    let status = response.status();
+    if status.as_u16() == 429 {
+        return AdapterError::RateLimited {
+            adapter: CursorAdapter::ID,
+            // The provider's own answer when it gave one; the coordinator's
+            // exponential backoff decides the rest.
+            retry_after: response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_secs),
+        };
+    }
+    if status.is_server_error() {
+        return AdapterError::Offline {
+            adapter: CursorAdapter::ID,
+            reason: format!("Cursor returned HTTP {status}"),
+        };
+    }
+    if status.as_u16() == 401 {
+        return quota_error("Cursor rejected the local access token; sign in again".to_string());
+    }
+    quota_error(format!("Cursor usage request returned HTTP {status}"))
 }
 
 fn dashboard_error(reason: String) -> AdapterError {
@@ -1194,6 +1399,105 @@ fn event_draft(
     draft
 }
 
+/// A placeholder for a request that has just been made.
+///
+/// Every token field is unknown rather than zero, which is the difference
+/// between "this cost nothing" and "what this cost is not known yet" — the
+/// first is a claim the data cannot support, and would quietly drag every
+/// average that touches it downwards.
+///
+/// The identifier is prefixed so a placeholder can never collide with the
+/// billed row that supersedes it. They are two statements about one request,
+/// and the retirement scope, not the deduplicator, is what resolves them.
+fn live_draft(adapter: &CursorAdapter, bubble: &CompactBubble) -> UsageRecordDraft {
+    let handle = bubble
+        .request_id
+        .clone()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| bubble.bubble_id.clone());
+
+    let mut draft = UsageRecordDraft::new(
+        SourceApp::Cursor,
+        adapter.provenance(Some(LIVE_SOURCE_REF)),
+    )
+    .with_raw_timestamp(bubble.created_at.clone())
+    .with_source_event_id(format!("live-{handle}"))
+    .with_tokens(TokenCounts::default());
+    draft.session_id = Some(bubble.conversation_id.clone());
+    draft.model = bubble.model.clone();
+    draft
+}
+
+/// The largest bubble rowid in the table, or zero when there are none.
+fn highest_bubble_rowid(connection: &Connection) -> Result<i64, AdapterError> {
+    connection
+        .query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| AdapterError::Unreadable {
+            adapter: CursorAdapter::ID,
+            reason: error.to_string(),
+        })
+}
+
+/// Bubbles inserted after `watermark`, with the highest rowid seen.
+///
+/// Bounded twice over: the rowid range keeps the scan proportional to what is
+/// new rather than to the table, and the row cap keeps one enormous catch-up —
+/// after a long sleep, say — from turning a latency read into a bulk import
+/// the dashboard is about to redo properly anyway.
+fn bubbles_after(
+    connection: &Connection,
+    watermark: i64,
+) -> Result<(Vec<CompactBubble>, i64), AdapterError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT rowid, key, value FROM cursorDiskKV
+             WHERE rowid > ?1 AND key LIKE 'bubbleId:%' AND length(key) >= 82
+             ORDER BY rowid LIMIT ?2",
+        )
+        .map_err(|error| AdapterError::Unreadable {
+            adapter: CursorAdapter::ID,
+            reason: error.to_string(),
+        })?;
+
+    let rows = statement
+        .query_map(rusqlite::params![watermark, LIVE_ACTIVITY_MAX_ROWS], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| AdapterError::Unreadable {
+            adapter: CursorAdapter::ID,
+            reason: error.to_string(),
+        })?;
+
+    let mut bubbles = Vec::new();
+    let mut highest = watermark;
+    for row in rows {
+        let (rowid, key, value) = row.map_err(|error| AdapterError::Unreadable {
+            adapter: CursorAdapter::ID,
+            reason: error.to_string(),
+        })?;
+        highest = highest.max(rowid);
+        // A row this pass cannot make sense of still advances the watermark:
+        // re-reading it every few seconds forever would cost the same and
+        // teach the same nothing.
+        if let Some(bubble) = compact_from_row(&key, &value) {
+            bubbles.push(bubble);
+        }
+    }
+    Ok((bubbles, highest))
+}
+
+/// The most rows one live read will take. Beyond this the watermark still
+/// advances, so the next read resumes rather than repeating.
+const LIVE_ACTIVITY_MAX_ROWS: i64 = 2_000;
+
 /// Pull every bubble row and rewrite it as a compact JSONL line.
 fn extract_bubbles_jsonl(connection: &Connection) -> Result<String, String> {
     let mut statement = connection
@@ -1513,6 +1817,151 @@ mod tests {
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].model.as_deref(), Some("grok-4.5"));
         assert_eq!(drafts[0].source_event_id.as_deref(), Some("req-1"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A state database holding `bubbles`, at a path of its own.
+    fn live_fixture(tag: &str, bubbles: &[(String, String)]) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir()
+            .join(format!("tokens-cursor-live-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("state.vscdb");
+
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);")
+            .unwrap();
+        for (key, value) in bubbles {
+            connection
+                .execute(
+                    "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![key, value],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        (dir, db_path)
+    }
+
+    fn user_bubble(bubble: &str, at: &str, request: &str, model: &str) -> (String, String) {
+        (
+            format!("bubbleId:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:{bubble}"),
+            format!(
+                r#"{{"type":1,"createdAt":"{at}","requestId":"{request}",
+                    "modelInfo":{{"modelName":"{model}"}},
+                    "tokenCount":{{"inputTokens":0,"outputTokens":0}}}}"#
+            ),
+        )
+    }
+
+    /// A live read resuming from `max_rowid`, or seeding when it is `None`.
+    fn live_request(now: DateTime<Utc>, max_rowid: Option<i64>) -> DeltaRequest {
+        DeltaRequest {
+            mode: SyncMode::Incremental,
+            checkpoints: max_rowid
+                .map(|rowid| SourceCheckpoint {
+                    adapter_id: CursorAdapter::ID.to_string(),
+                    source_key: LIVE_CHECKPOINT.to_string(),
+                    payload: serde_json::json!({ "maxRowid": rowid }),
+                })
+                .into_iter()
+                .collect(),
+            now,
+        }
+    }
+
+    #[test]
+    fn the_first_live_read_seeds_a_watermark_without_inventing_history() {
+        // Everything already in the database has been billed long since.
+        // Emitting a placeholder for each would fabricate a burst of activity
+        // out of the act of opening the app.
+        let now = Utc::now();
+        let stamp = now.to_rfc3339();
+        let (dir, db_path) = live_fixture(
+            "seed",
+            &[
+                user_bubble("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", &stamp, "req-1", "gpt-5.2"),
+                user_bubble("cccccccc-cccc-cccc-cccc-cccccccccccc", &stamp, "req-2", "gpt-5.2"),
+            ],
+        );
+
+        let adapter = CursorAdapter::with_db(db_path);
+        let delta = adapter
+            .read_live_activity(&live_request(now, None))
+            .unwrap();
+
+        assert!(delta.drafts.is_empty(), "seeding invents no activity");
+        let stored: LiveCheckpoint =
+            serde_json::from_value(delta.checkpoints[0].payload.clone()).unwrap();
+        assert_eq!(stored.max_rowid, Some(2), "the watermark is the table's end");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_turn_becomes_a_placeholder_with_its_price_unknown() {
+        let now = Utc::now();
+        let stamp = now.to_rfc3339();
+        let (dir, db_path) = live_fixture(
+            "new-turn",
+            &[
+                user_bubble("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", &stamp, "req-1", "gpt-5.2"),
+                user_bubble("cccccccc-cccc-cccc-cccc-cccccccccccc", &stamp, "req-2", "composer-2"),
+            ],
+        );
+
+        // Resume from the first row, as a second poll would.
+        let adapter = CursorAdapter::with_db(db_path);
+        let delta = adapter
+            .read_live_activity(&live_request(now, Some(1)))
+            .unwrap();
+
+        assert_eq!(delta.drafts.len(), 1, "only the row that is new");
+        let draft = &delta.drafts[0];
+        assert_eq!(draft.model.as_deref(), Some("composer-2"));
+        assert_eq!(draft.source_event_id.as_deref(), Some("live-req-2"));
+        assert_eq!(
+            draft.provenance.source_ref.as_deref(),
+            Some(LIVE_SOURCE_REF),
+            "a placeholder belongs to its own dataset, not the billed one"
+        );
+        // The whole point: present, and honest about what is not known.
+        assert!(!draft.tokens.input.is_known());
+        assert!(!draft.tokens.output.is_known());
+        assert!(draft.cost.is_none());
+        // A placeholder never deletes anything; retirement is the dashboard's.
+        assert!(delta.replace_scopes.is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_stale_row_arriving_late_does_not_become_a_live_placeholder() {
+        // A bubble written now but timestamped days ago is history being
+        // rewritten, not a request being made. The billed feed owns that.
+        let now = Utc::now();
+        let old = (now - chrono::Duration::days(2)).to_rfc3339();
+        let (dir, db_path) = live_fixture(
+            "stale",
+            &[user_bubble(
+                "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                &old,
+                "req-old",
+                "gpt-5.2",
+            )],
+        );
+
+        let adapter = CursorAdapter::with_db(db_path);
+        let delta = adapter
+            .read_live_activity(&live_request(now, Some(0)))
+            .unwrap();
+        assert!(delta.drafts.is_empty());
+        // The watermark still advances, so it is not reconsidered every poll.
+        let stored: LiveCheckpoint =
+            serde_json::from_value(delta.checkpoints[0].payload.clone()).unwrap();
+        assert_eq!(stored.max_rowid, Some(1));
 
         fs::remove_dir_all(&dir).unwrap();
     }

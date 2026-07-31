@@ -36,7 +36,7 @@ use super::{
 
 /// Bumped whenever the stored shape changes. Migrations run in order and are
 /// recorded, so an older install upgrades in place instead of starting over.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// The base shape, created for a fresh store. `quota_samples` is *not* here:
 /// it arrives as migration 2, so a store written before it existed upgrades
@@ -100,9 +100,20 @@ const BASE_SCHEMA: &str = r#"
 /// carried per row because it identifies the window instance: a delta is only
 /// ever taken between samples sharing one. All instants are milliseconds since
 /// the Unix epoch, like every other timestamp in this schema.
-const MIGRATIONS: &[(u32, &str)] = &[(
-    2,
-    r#"
+///
+/// Migration 3 adds `records.source_ref`, so a replace scope can name one
+/// dataset within an adapter rather than all of them. It is denormalised out
+/// of the payload because the scope query filters on it, and deserialising
+/// every record in the store to answer that would defeat the index.
+///
+/// Existing rows are backfilled from the payload they already carry, so a
+/// store written before this column existed ends in exactly the shape a new
+/// one does. A row whose payload names no `source_ref` keeps SQL `NULL`,
+/// which is what a scope that names no dataset matches.
+const MIGRATIONS: &[(u32, &str)] = &[
+    (
+        2,
+        r#"
     CREATE TABLE IF NOT EXISTS quota_samples (
         source_app          TEXT NOT NULL,
         label               TEXT NOT NULL,
@@ -115,7 +126,19 @@ const MIGRATIONS: &[(u32, &str)] = &[(
     CREATE INDEX IF NOT EXISTS quota_samples_recent
         ON quota_samples (source_app, label, window_minutes, observed_at DESC);
     "#,
-)];
+    ),
+    (
+        3,
+        r#"
+    ALTER TABLE records ADD COLUMN source_ref TEXT;
+    UPDATE records
+       SET source_ref = json_extract(payload, '$.provenance.sourceRef')
+     WHERE source_ref IS NULL;
+    CREATE INDEX IF NOT EXISTS records_by_dataset_time
+        ON records (source_app, adapter_id, source_ref, event_timestamp_utc);
+    "#,
+    ),
+];
 
 const META_REVISION: &str = "revision";
 
@@ -409,9 +432,13 @@ fn apply(
         .map(|record| record.dedupe_key.as_str())
         .collect();
     for scope in &batch.replace_scopes {
+        // A scope naming no dataset covers all of them, so the `?5 IS NULL`
+        // arm is the whole filter for a single-dataset adapter and costs one
+        // constant comparison.
         let mut statement = transaction.prepare(
             "SELECT dedupe_key FROM records
              WHERE source_app = ?1 AND adapter_id = ?2
+               AND (?5 IS NULL OR source_ref IS ?5)
                AND event_timestamp_utc IS NOT NULL
                AND event_timestamp_utc >= ?3 AND event_timestamp_utc < ?4",
         )?;
@@ -422,6 +449,7 @@ fn apply(
                     scope.adapter_id,
                     scope.from.timestamp_millis(),
                     scope.until.timestamp_millis(),
+                    scope.source_ref,
                 ],
                 |row| row.get::<_, String>(0),
             )?
@@ -457,13 +485,14 @@ fn apply(
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         transaction.execute(
             "INSERT INTO records
-                (dedupe_key, content_hash, source_app, adapter_id,
+                (dedupe_key, content_hash, source_app, adapter_id, source_ref,
                  event_timestamp_utc, normalization_version, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(dedupe_key) DO UPDATE SET
                 content_hash = excluded.content_hash,
                 source_app = excluded.source_app,
                 adapter_id = excluded.adapter_id,
+                source_ref = excluded.source_ref,
                 event_timestamp_utc = excluded.event_timestamp_utc,
                 normalization_version = excluded.normalization_version,
                 payload = excluded.payload",
@@ -472,6 +501,7 @@ fn apply(
                 record.content_hash,
                 record.source_app.as_str(),
                 record.provenance.adapter_id,
+                record.provenance.source_ref,
                 record.event_timestamp_utc.map(|at| at.timestamp_millis()),
                 record.normalization_version,
                 payload,
@@ -844,6 +874,7 @@ mod tests {
                 replace_scopes: vec![ReplaceScope {
                     source_app: SourceApp::Codex,
                     adapter_id: "codex".to_string(),
+                    source_ref: None,
                     from: Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),
                     until: Utc.with_ymd_and_hms(2026, 7, 2, 0, 0, 0).unwrap(),
                 }],
@@ -869,6 +900,7 @@ mod tests {
                 replace_scopes: vec![ReplaceScope {
                     source_app: SourceApp::Codex,
                     adapter_id: "codex".to_string(),
+                    source_ref: None,
                     from: Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),
                     until: Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap(),
                 }],
@@ -878,6 +910,52 @@ mod tests {
 
         assert_eq!(outcome.counts.deleted, 1);
         assert_eq!(repository.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_replace_scope_only_touches_its_own_dataset() {
+        // One adapter reading its source two ways at once — Cursor's billed
+        // events and its local activity. Without the dataset in the scope each
+        // pass would sweep away the other's rows, so the two would take turns
+        // deleting each other for as long as both kept running.
+        let repository = store();
+        let mut billed = record("billed", 5, 10);
+        billed.provenance.source_ref = Some("dashboard-usage-events".to_string());
+        let mut live = record("live", 5, 10);
+        live.provenance.source_ref = Some("local-activity".to_string());
+        repository.commit(usage(vec![billed, live])).unwrap();
+
+        let outcome = repository
+            .commit(SourceTransaction {
+                replace_scopes: vec![ReplaceScope {
+                    source_app: SourceApp::Codex,
+                    adapter_id: "codex".to_string(),
+                    source_ref: Some("dashboard-usage-events".to_string()),
+                    from: Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),
+                    until: Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap(),
+                }],
+                ..usage(vec![])
+            })
+            .unwrap();
+
+        assert_eq!(outcome.counts.deleted, 1, "only the billed row");
+        assert_eq!(repository.count().unwrap(), 1);
+
+        // And a scope naming no dataset still covers every one of them.
+        let outcome = repository
+            .commit(SourceTransaction {
+                replace_scopes: vec![ReplaceScope {
+                    source_app: SourceApp::Codex,
+                    adapter_id: "codex".to_string(),
+                    source_ref: None,
+                    from: Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),
+                    until: Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap(),
+                }],
+                ..usage(vec![])
+            })
+            .unwrap();
+        assert_eq!(outcome.counts.deleted, 1);
+        assert_eq!(repository.count().unwrap(), 0);
     }
 
     #[test]
@@ -1057,25 +1135,32 @@ mod tests {
     }
 
     #[test]
-    fn a_version_one_store_upgrades_to_quota_samples() {
-        // Open a fresh store (base schema is version 1 shape), drop the
-        // sample table and stamp version 1, then reopen: the migration runner
-        // must recreate the table and bump the version without losing data.
+    fn a_version_one_store_upgrades_to_the_current_shape() {
+        // Open a fresh store, strip it back to the version 1 shape — no
+        // sample table, no `source_ref` column — and stamp it accordingly.
+        // Reopening must carry it forward without losing what it held.
         let directory = std::env::temp_dir().join(format!("tokens-mig-{}", std::process::id()));
         let path = directory.join("usage.sqlite3");
         let _ = std::fs::remove_dir_all(&directory);
 
+        let mut dashboard = record("e1", 1, 10);
+        dashboard.provenance.source_ref = Some("dashboard-usage-events".to_string());
+
         {
+            // Write first, then strip: the row has to predate the column for
+            // the backfill to be the thing under test.
             let repository = SqliteUsageRepository::open(&path).unwrap();
+            repository.commit(usage(vec![dashboard])).unwrap();
             repository
                 .with_connection(|connection| {
                     connection.execute_batch(
                         "DROP TABLE quota_samples;
+                         DROP INDEX IF EXISTS records_by_dataset_time;
+                         ALTER TABLE records DROP COLUMN source_ref;
                          UPDATE meta SET value = '1' WHERE key = 'schema_version';",
                     )
                 })
                 .unwrap();
-            repository.commit(usage(vec![record("e1", 1, 10)])).unwrap();
         }
 
         let reopened = SqliteUsageRepository::open(&path).unwrap();
@@ -1085,6 +1170,16 @@ mod tests {
             .quota_samples(Utc.timestamp_opt(0, 0).unwrap())
             .unwrap();
         assert_eq!(samples.len(), 0);
+
+        // And the new column was filled from the payload each row already
+        // carried, so a scope naming a dataset can find rows written before
+        // the column existed.
+        let backfilled: Option<String> = reopened
+            .with_connection(|connection| {
+                connection.query_row("SELECT source_ref FROM records", [], |row| row.get(0))
+            })
+            .unwrap();
+        assert_eq!(backfilled.as_deref(), Some("dashboard-usage-events"));
 
         let _ = std::fs::remove_dir_all(&directory);
     }

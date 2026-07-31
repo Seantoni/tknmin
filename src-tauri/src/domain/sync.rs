@@ -95,9 +95,17 @@ pub struct SourceCheckpoint {
 #[serde(rename_all = "camelCase")]
 pub struct ReplaceScope {
     pub source_app: SourceApp,
-    /// Restricts the scope to records this adapter produced, so local and
-    /// dashboard Cursor rows can never delete each other.
+    /// Restricts the scope to records this adapter produced.
     pub adapter_id: String,
+    /// Restricts it further to one dataset within that adapter.
+    ///
+    /// One adapter can read the same source two ways at once — Cursor's billed
+    /// dashboard events and its local activity are both `cursor` records over
+    /// the same minutes — and a scope that named only the adapter would have
+    /// each sweep away the other's rows on every pass. `None` means every
+    /// dataset, which is what a single-dataset adapter wants.
+    #[serde(default)]
+    pub source_ref: Option<String>,
     pub from: DateTime<Utc>,
     pub until: DateTime<Utc>,
 }

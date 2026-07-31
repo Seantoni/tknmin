@@ -170,6 +170,11 @@ impl UsageWriter for InMemoryUsageRepository {
                 .filter(|record| {
                     record.source_app == scope.source_app
                         && record.provenance.adapter_id == scope.adapter_id
+                        // A scope naming no dataset covers all of them.
+                        && scope
+                            .source_ref
+                            .as_ref()
+                            .is_none_or(|wanted| record.provenance.source_ref.as_ref() == Some(wanted))
                         && record
                             .event_timestamp_utc
                             .is_some_and(|at| at >= scope.from && at < scope.until)
@@ -404,6 +409,7 @@ mod tests {
                 replace_scopes: vec![ReplaceScope {
                     source_app: SourceApp::Cursor,
                     adapter_id: "test".to_string(),
+                    source_ref: None,
                     from: instant(10),
                     until: instant(12),
                 }],

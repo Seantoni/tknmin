@@ -69,8 +69,9 @@ pub enum RefreshTrigger {
     /// A dashboard session was connected or disconnected, which swaps which
     /// dataset is authoritative for Cursor.
     CursorConnectionChanged,
-    /// The quota lane's own deadline came round.
-    ScheduledQuota,
+    /// This source's quota lane reached its own deadline. Per source, because
+    /// each lane runs at the cadence its own recent activity earned.
+    ScheduledQuota(SourceApp),
     /// The periodic safety net: repair whatever the watchers missed.
     Reconciliation,
     /// A window was focused or shown. A cheap catch-up, never a scan.
@@ -121,9 +122,22 @@ pub struct RefreshPolicy {
     /// The thorough safety net: re-reads bounded windows so corrections and
     /// deletions converge.
     pub full_reconcile: Duration,
-    /// How often allowance windows are re-read. More frequent than a full
-    /// import because thresholds are time-sensitive and the read is cheap.
+    /// How often an idle source's allowance windows are re-read. More
+    /// frequent than a full import because thresholds are time-sensitive and
+    /// the read is cheap.
     pub quota_interval: Duration,
+    /// How often they are re-read while the source is being actively used.
+    ///
+    /// An allowance moves only when requests are made, so the interval that
+    /// matters is the one in force during a burst. Polling this fast around
+    /// the clock would be waste; polling this slowly during a burst is what
+    /// makes a percentage look frozen for the minute it is being watched
+    /// hardest.
+    pub quota_hot_interval: Duration,
+    /// How long detected activity keeps a source on the hot interval. Long
+    /// enough to cover the gap between two requests in one working session,
+    /// so a pause for thought does not drop back to the idle cadence.
+    pub quota_hot_window: Duration,
     /// First retry delay after a failure that looked like connectivity.
     pub backoff_base: Duration,
     /// The ceiling on that retry delay.
@@ -142,10 +156,16 @@ impl Default for RefreshPolicy {
             metadata_reconcile: Duration::from_secs(45),
             full_reconcile: Duration::from_secs(12 * 60),
             quota_interval: Duration::from_secs(60),
+            quota_hot_interval: Duration::from_secs(12),
+            quota_hot_window: Duration::from_secs(3 * 60),
             backoff_base: Duration::from_secs(5),
             backoff_max: Duration::from_secs(5 * 60),
             upstream_retry_window: Duration::from_secs(15 * 60),
-            upstream_retry_interval: Duration::from_secs(90),
+            // Below `metadata_reconcile` on purpose. The reconciliation pass
+            // already re-reads every source incrementally, so a retry slower
+            // than it never fires first and the mechanism built for exactly
+            // this case would contribute nothing.
+            upstream_retry_interval: Duration::from_secs(20),
         }
     }
 }
@@ -279,6 +299,19 @@ struct Lane {
     backoff_until: Option<Instant>,
     /// While set, the lane keeps re-asking whether upstream has published.
     upstream_deadline: Option<Instant>,
+    /// Quota lanes only: when this lane next polls its allowance endpoint.
+    ///
+    /// Per lane rather than one timer for all sources, because the sources do
+    /// not become interesting at the same moments: the one being typed into
+    /// needs a fresh number now, and the two that have been idle for an hour
+    /// do not.
+    next_poll: Option<Instant>,
+    /// Quota lanes only: while set, this source is in use and polls on the
+    /// hot interval.
+    hot_until: Option<Instant>,
+    /// Quota lanes only: when this lane last began a poll. The floor under
+    /// every request to bring the next one forward.
+    last_poll_at: Option<Instant>,
 }
 
 impl Lane {
@@ -290,6 +323,9 @@ impl Lane {
             consecutive_failures: 0,
             backoff_until: None,
             upstream_deadline: None,
+            next_poll: None,
+            hot_until: None,
+            last_poll_at: None,
         }
     }
 }
@@ -405,15 +441,19 @@ impl Scheduler {
     fn run(mut self, inbox: Receiver<Message>) {
         let mut next_metadata_reconcile = Instant::now() + self.policy.metadata_reconcile;
         let mut next_full_reconcile = Instant::now() + self.policy.full_reconcile;
-        let mut next_quota = Instant::now() + self.policy.quota_interval;
+        // Quota lanes carry their own deadlines, so they are seeded here
+        // rather than created by whichever trigger happens to name them first.
+        let idle = self.policy.quota_interval;
+        for source in self.sources() {
+            self.lane(quota_lane(source)).next_poll = Some(Instant::now() + idle);
+        }
         // A tick that took far longer than it was asked to wait means the
         // machine slept. Every watcher missed everything in between, so the
         // honest response is to reconcile rather than trust the queue.
         let mut last_tick = Instant::now();
 
         loop {
-            let wait =
-                self.next_wakeup(&[next_metadata_reconcile, next_full_reconcile, next_quota]);
+            let wait = self.next_wakeup(&[next_metadata_reconcile, next_full_reconcile]);
 
             match inbox.recv_timeout(wait) {
                 Ok(Message::Trigger(trigger)) => self.accept(trigger),
@@ -436,16 +476,17 @@ impl Scheduler {
             if now >= next_full_reconcile {
                 next_full_reconcile = now + self.policy.full_reconcile;
                 self.enqueue_all(SyncMode::Reconcile, RefreshCategory::Usage, Duration::ZERO);
-                // Quota samples exist only to measure a trailing pace. Once
-                // they are older than the longest horizon in use they are
-                // weight, so the idle path drops them.
-                let cutoff = Utc::now() - chrono::Duration::days(7);
+                // Quota samples exist only to measure a trailing pace and to
+                // fit the rate a projection rests on. Once they are older than
+                // the longest horizon in use they are weight, so the idle path
+                // drops them — but not one day sooner, because a monthly
+                // billing window needs weeks of history before its movement
+                // adds up to a rate that can be fitted at all.
+                let cutoff =
+                    Utc::now() - chrono::Duration::days(crate::repository::SAMPLE_HORIZON_DAYS);
                 let _ = self.writer.prune_quota_samples(cutoff);
             }
-            if now >= next_quota {
-                next_quota = now + self.policy.quota_interval;
-                self.accept(RefreshTrigger::ScheduledQuota);
-            }
+            self.poll_due_quotas(now);
 
             self.dispatch();
             self.publish_status();
@@ -462,8 +503,78 @@ impl Scheduler {
                 let due = lane.backoff_until.map_or(due, |until| due.max(until));
                 earliest = earliest.min(due);
             }
+            // A quota lane's own deadline is as real as any timer above: miss
+            // it here and the loop sleeps straight through the poll.
+            if let Some(next_poll) = lane.next_poll {
+                earliest = earliest.min(next_poll);
+            }
         }
         earliest.saturating_duration_since(now).max(MIN_WAIT)
+    }
+
+    /// Enqueue every quota lane whose own deadline has arrived, and set the
+    /// next one at whichever cadence that lane is currently on.
+    fn poll_due_quotas(&mut self, now: Instant) {
+        let due: Vec<LaneKey> = self
+            .lanes
+            .iter()
+            .filter(|(key, lane)| {
+                key.category == RefreshCategory::Quota
+                    && lane.next_poll.is_some_and(|at| now >= at)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+
+        for key in due {
+            self.reschedule_quota_poll(key, now);
+            // Through `accept` like everything else, so the trigger list stays
+            // the complete account of why this application reads a source.
+            self.accept(RefreshTrigger::ScheduledQuota(key.source_app));
+        }
+    }
+
+    /// Set a quota lane's next deadline from whether it is currently hot.
+    fn reschedule_quota_poll(&mut self, key: LaneKey, now: Instant) {
+        let policy = self.policy;
+        let lane = self.lane(key);
+        let hot = lane.hot_until.is_some_and(|until| now < until);
+        if !hot {
+            lane.hot_until = None;
+        }
+        lane.next_poll = Some(
+            now + if hot {
+                policy.quota_hot_interval
+            } else {
+                policy.quota_interval
+            },
+        );
+    }
+
+    /// Ask for this source's allowance sooner, as soon as the hot interval
+    /// allows: at once when nothing has been read for longer than that, and
+    /// otherwise at the moment it elapses.
+    ///
+    /// The throttle is the point. These requests arrive from a filesystem
+    /// watcher that fires on every write Cursor persists, and enqueueing each
+    /// one directly would put a network round trip behind every keystroke —
+    /// which is not a faster number, only a louder one.
+    fn nudge_quota_lane(&mut self, source: SourceApp) {
+        let interval = self.policy.quota_hot_interval;
+        let now = Instant::now();
+        let lane = self.lane(quota_lane(source));
+        let soonest = lane.last_poll_at.map_or(now, |last| last + interval);
+        lane.next_poll = Some(lane.next_poll.map_or(soonest, |at| at.min(soonest)));
+    }
+
+    /// Nudge, and keep the source on the hot interval for a while yet.
+    ///
+    /// Separate from a nudge because they answer different questions. Focusing
+    /// a window means the number is being read now; making a request means
+    /// more are likely, and the cadence should hold until they stop.
+    fn heat_quota_lane(&mut self, source: SourceApp) {
+        let window = self.policy.quota_hot_window;
+        self.lane(quota_lane(source)).hot_until = Some(Instant::now() + window);
+        self.nudge_quota_lane(source);
     }
 
     /// Translate a trigger into work on lanes. This is the only place a
@@ -494,14 +605,22 @@ impl Scheduler {
                     debounce,
                 )
             }
-            CursorLocalActivity => self.enqueue(
-                LaneKey {
-                    source_app: SourceApp::Cursor,
-                    category: RefreshCategory::Usage,
-                },
-                SyncMode::Incremental,
-                debounce,
-            ),
+            CursorLocalActivity => {
+                self.enqueue(
+                    LaneKey {
+                        source_app: SourceApp::Cursor,
+                        category: RefreshCategory::Usage,
+                    },
+                    SyncMode::Incremental,
+                    debounce,
+                );
+                // Cursor writing locally means requests are being made, and a
+                // request is the only thing that moves an allowance. Reading
+                // usage without also asking what it consumed is what left the
+                // percentage waiting out a minute of a timer it had no part
+                // in, while the source it describes was in active use.
+                self.heat_quota_lane(SourceApp::Cursor);
+            }
             CursorConnectionChanged => {
                 // Connecting or disconnecting swaps which Cursor dataset is
                 // authoritative. Bumping the generation is what stops a job
@@ -522,8 +641,8 @@ impl Scheduler {
                     Duration::ZERO,
                 );
             }
-            ScheduledQuota => {
-                self.enqueue_all(SyncMode::QuotaOnly, RefreshCategory::Quota, Duration::ZERO)
+            ScheduledQuota(source) => {
+                self.enqueue(quota_lane(source), SyncMode::QuotaOnly, Duration::ZERO)
             }
             Startup | Manual | Wake | NetworkRecovery => {
                 self.enqueue_all(SyncMode::Reconcile, RefreshCategory::Usage, Duration::ZERO);
@@ -534,7 +653,7 @@ impl Scheduler {
                     lane.backoff_until = None;
                 }
             }
-            Reconciliation | WindowFocus => {
+            Reconciliation => {
                 // The cheap pass: incremental mode means each source checks
                 // metadata and reads only what actually moved, so a dropped
                 // watcher event is repaired without re-reading any history.
@@ -543,6 +662,24 @@ impl Scheduler {
                     RefreshCategory::Usage,
                     Duration::ZERO,
                 )
+            }
+            WindowFocus => {
+                self.enqueue_all(
+                    SyncMode::Incremental,
+                    RefreshCategory::Usage,
+                    Duration::ZERO,
+                );
+                // Someone is looking at the numbers. An allowance percentage
+                // is the one thing on screen that cannot be recomputed from
+                // what is already stored, so being mid-interval is the
+                // difference between a current figure and a minute-old one at
+                // the exact moment it is being read. A nudge rather than a
+                // job, so a storm of focus events cannot become a storm of
+                // requests — and so a reading taken seconds ago is recognised
+                // as already current.
+                for source in self.sources() {
+                    self.nudge_quota_lane(source);
+                }
             }
         }
     }
@@ -633,6 +770,12 @@ impl Scheduler {
                 lane.pending = None;
                 lane.running = true;
                 lane.generation += 1;
+                if key.category == RefreshCategory::Quota {
+                    // However this poll came to be asked for — a deadline, a
+                    // focus, a startup — it is the reading every later request
+                    // to hurry is measured against.
+                    lane.last_poll_at = Some(now);
+                }
                 lane.generation
             };
 
@@ -682,6 +825,10 @@ impl Scheduler {
             return;
         }
 
+        // Deferred so the source's *other* lane can be reached after this
+        // one's borrow ends.
+        let mut heat_quota = false;
+
         match result.outcome {
             Ok(outcome) => {
                 lane.consecutive_failures = 0;
@@ -701,6 +848,12 @@ impl Scheduler {
                                 due: now + policy.upstream_retry_interval,
                                 latest: now + policy.upstream_retry_interval,
                             });
+                            // Billing owes this source numbers it has not
+                            // published. The account endpoint aggregates on a
+                            // different schedule and may well have them
+                            // already, so this is precisely when it is worth
+                            // asking often.
+                            heat_quota = result.lane.category == RefreshCategory::Usage;
                         } else {
                             lane.upstream_deadline = None;
                         }
@@ -727,6 +880,10 @@ impl Scheduler {
                     });
                 }
             }
+        }
+
+        if heat_quota {
+            self.heat_quota_lane(result.lane.source_app);
         }
     }
 
@@ -762,6 +919,14 @@ const SLEEP_SUSPICION: Duration = Duration::from_secs(20);
 const IDLE_TICK: Duration = Duration::from_secs(30);
 /// Never spin: even a deadline already past waits a moment.
 const MIN_WAIT: Duration = Duration::from_millis(10);
+
+/// One source's allowance lane, named often enough to deserve a name.
+fn quota_lane(source_app: SourceApp) -> LaneKey {
+    LaneKey {
+        source_app,
+        category: RefreshCategory::Quota,
+    }
+}
 
 /// The wider of two modes, since a lane asked for both should do the one that
 /// subsumes the other.
@@ -1165,6 +1330,7 @@ mod tests {
             metadata_reconcile: Duration::from_secs(600),
             full_reconcile: Duration::from_secs(600),
             quota_interval: Duration::from_secs(600),
+            quota_hot_interval: Duration::from_secs(600),
             ..RefreshPolicy::default()
         }
     }
@@ -1438,12 +1604,113 @@ mod tests {
         handle.submit(RefreshTrigger::LocalSourceChanged(SourceApp::Codex));
         std::thread::sleep(Duration::from_millis(150));
 
-        assert_eq!(slow_calls.load(Ordering::SeqCst), 1);
+        // Cursor activity claims both of Cursor's lanes — usage and the
+        // allowance that usage moves — and each is single-flight, so two jobs
+        // start and neither can start twice.
+        assert_eq!(slow_calls.load(Ordering::SeqCst), 2);
         assert_eq!(
             fast_calls.load(Ordering::SeqCst),
             1,
             "Codex waited behind the slow Cursor job"
         );
+    }
+
+    #[test]
+    fn cursor_activity_refreshes_the_allowance_not_only_the_usage() {
+        // The percentage is the number a burst is watched through, and it can
+        // only be re-read from the source. Leaving it to a timer is what made
+        // it sit still for a minute at the moment it was being watched.
+        let (adapter, _, _) = ScriptedAdapter::new(SourceApp::Cursor);
+        let handle = RefreshCoordinator::with_adapters(
+            vec![adapter],
+            Arc::new(InMemoryUsageRepository::new()),
+            Arc::new(SilentObserver),
+        )
+        .with_policy(RefreshPolicy {
+            local_debounce: Duration::from_millis(10),
+            local_max_delay: Duration::from_millis(20),
+            ..quiet_policy()
+        })
+        .start();
+
+        handle.submit(RefreshTrigger::CursorLocalActivity);
+        std::thread::sleep(Duration::from_millis(120));
+
+        let quota = handle
+            .status()
+            .into_iter()
+            .find(|(key, _)| key.category == RefreshCategory::Quota)
+            .expect("cursor activity gives the allowance lane work to do");
+        assert!(quota.1.generation >= 1, "the allowance lane ran");
+    }
+
+    #[test]
+    fn continuous_activity_does_not_become_a_request_per_write() {
+        // The watcher fires on every write Cursor persists, and the allowance
+        // endpoint is a network round trip. The hot interval is the ceiling on
+        // how often that is paid, however hard the source is being used.
+        struct QuotaCounting {
+            polls: Arc<AtomicUsize>,
+        }
+        impl SourceAdapter for QuotaCounting {
+            fn id(&self) -> &'static str {
+                "quota-counting"
+            }
+            fn version(&self) -> &'static str {
+                "1.0.0"
+            }
+            fn source_app(&self) -> SourceApp {
+                SourceApp::Cursor
+            }
+            fn read_delta(&self, request: &DeltaRequest) -> Result<SourceDelta, AdapterError> {
+                if request.mode == SyncMode::QuotaOnly {
+                    self.polls.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(SourceDelta::default())
+            }
+        }
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let handle = RefreshCoordinator::with_adapters(
+            vec![Arc::new(QuotaCounting {
+                polls: Arc::clone(&polls),
+            })],
+            Arc::new(InMemoryUsageRepository::new()),
+            Arc::new(SilentObserver),
+        )
+        .with_policy(RefreshPolicy {
+            local_debounce: Duration::from_millis(5),
+            local_max_delay: Duration::from_millis(10),
+            quota_hot_interval: Duration::from_millis(100),
+            ..quiet_policy()
+        })
+        .start();
+
+        // Four hundred writes across four hot intervals.
+        for _ in 0..400 {
+            handle.submit(RefreshTrigger::CursorLocalActivity);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let ran = polls.load(Ordering::SeqCst);
+        assert!(ran >= 2, "activity should have refreshed the allowance");
+        assert!(
+            ran <= 8,
+            "{ran} allowance polls for 400 writes: the interval is not holding"
+        );
+    }
+
+    #[test]
+    fn an_idle_source_polls_its_allowance_on_the_slow_interval() {
+        // The hot cadence is earned by activity, not granted by default: three
+        // sources polling a network endpoint every twelve seconds around the
+        // clock is exactly the waste the single-owner design exists to avoid.
+        let policy = RefreshPolicy::default();
+        assert!(policy.quota_hot_interval < policy.quota_interval);
+        // And a retry slower than the pass that already re-reads everything
+        // would never be the thing that fires first.
+        assert!(policy.upstream_retry_interval < policy.metadata_reconcile);
     }
 
     #[test]

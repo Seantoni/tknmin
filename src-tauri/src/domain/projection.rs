@@ -16,11 +16,12 @@
 //! ```
 //!
 //! `tenths_per_unit` is not assumed, it is **fitted** from the source's own
-//! history. Every pair of consecutive confirmed readings brackets a period
-//! whose token spend is known exactly, so each pair is one observation of the
-//! rate. The fit improves as the app runs, and — the property that makes this
-//! safe — every new confirmed reading also *re-anchors* the projection, so
-//! error cannot accumulate across anchors.
+//! history. Confirmed readings are walked into non-overlapping spans, each
+//! wide enough that the movement across it is signal rather than rounding, and
+//! each bracketing a period whose token spend is known exactly — so every span
+//! is one observation of the rate. The fit improves as the app runs, and — the
+//! property that makes this safe — every new confirmed reading also
+//! *re-anchors* the projection, so error cannot accumulate across anchors.
 //!
 //! Three rules keep a derived number from being passed off as a measured one:
 //!
@@ -50,13 +51,17 @@ use super::source::SourceApp;
 /// spend multiplied by it stays far inside `u64`.
 const RATE_SCALE: u64 = 1_000_000_000_000;
 
-/// How many usable pairs a fit needs before it is allowed to say anything.
-/// Two pairs cannot disagree, so they cannot reveal that the model is wrong.
+/// How many usable spans a fit needs before it is allowed to say anything.
+/// Two spans cannot disagree, so they cannot reveal that the model is wrong.
 const MIN_PAIRS: usize = 3;
 
-/// The smallest movement between two readings that can anchor a pair. The
+/// The smallest movement a span must accumulate before it can be fitted. The
 /// source reports tenths, so a two-point move carries a quantisation error of
 /// roughly one part in twenty; anything smaller is mostly rounding.
+///
+/// This is a threshold on the span, not on adjacent readings: a span keeps
+/// extending until it clears this, which is what lets a long window — where
+/// each stored reading moves by a tenth or two — ever be fitted at all.
 const MIN_PAIR_TENTHS: u16 = 20;
 
 /// The widest spread a fit may show, as a percentage of its own median, before
@@ -170,7 +175,7 @@ pub struct QuotaCalibration {
     pub window_minutes: u32,
     /// Tenths of a percent per [`RATE_SCALE`] cost units.
     pub tenths_per_tera_unit: u64,
-    /// How many confirmed-reading pairs the fit rests on.
+    /// How many confirmed-reading spans the fit rests on.
     pub pairs: usize,
     /// The widest deviation from the median rate, as an integer percent of it.
     /// Small means the model explains the data; large means something else is
@@ -257,13 +262,27 @@ fn fit_window(
         .collect();
     window.sort_by_key(|sample| sample.observed_at);
 
-    // Each adjacent pair inside one window instance is an independent
-    // observation of the rate. Pairs spanning a reset are skipped: the used
-    // figure drops to zero across one, and differencing it invents a negative.
+    // Each span inside one window instance is an independent observation of
+    // the rate. A span is anchored at a sample and extended until the reading
+    // has moved far enough to mean something, then the next span is anchored
+    // where it ended — so spans never overlap and every reading is used.
+    //
+    // Extending rather than only comparing adjacent samples is what makes this
+    // work on a long window. A sample is stored on every tenth of a percent
+    // that moves, so on a monthly billing cycle consecutive readings differ by
+    // one or two tenths and no adjacent pair ever clears the threshold; the
+    // rate could never be fitted at all, and the window that most needs
+    // carrying forward is the one that never gets it. Spans spanning a reset
+    // are still refused: the used figure drops to zero across one, and
+    // differencing it invents a negative.
     let mut rates: Vec<u64> = Vec::new();
-    for pair in window.windows(2) {
-        let (left, right) = (pair[0], pair[1]);
+    let mut anchor = 0;
+    for index in 1..window.len() {
+        let (left, right) = (window[anchor], window[index]);
         if !same_window_instance(left.resets_at, right.resets_at) {
+            // The reset landed between these two. Nothing before it can be
+            // differenced against anything after, so start again here.
+            anchor = index;
             continue;
         }
         let moved = right
@@ -272,6 +291,7 @@ fn fit_window(
         if moved < MIN_PAIR_TENTHS {
             continue;
         }
+        anchor = index;
         let units = units_between(
             records,
             quota.source_app,
@@ -281,10 +301,10 @@ fn fit_window(
         if units == 0 {
             // The allowance moved with no local spend to explain it — another
             // surface drawing on the same account, or history older than the
-            // records kept. Either way this pair teaches nothing.
+            // records kept. Either way this span teaches nothing.
             continue;
         }
-        // Rounded so the rate a pair yields, applied back to that pair's own
+        // Rounded so the rate a span yields, applied back to that span's own
         // spend, reproduces the movement it was fitted from.
         let numerator = u64::from(moved).saturating_mul(RATE_SCALE);
         rates.push((numerator + units / 2) / units);
@@ -543,6 +563,82 @@ mod tests {
             10_000,
         )];
         assert!(fit_calibrations(&[quota(100, 10)], &samples, &records).is_empty());
+    }
+
+    /// Cursor's monthly billing pool.
+    const BILLING_MONTH: u32 = 30 * 24 * 60;
+
+    fn monthly_sample(minute: i64, used: u16) -> QuotaSample {
+        QuotaSample {
+            source_app: SourceApp::Cursor,
+            label: Some("Cursor Models".to_string()),
+            window_minutes: BILLING_MONTH,
+            used_percent_tenths: used,
+            resets_at: Some(at(i64::from(BILLING_MONTH))),
+            observed_at: at(minute),
+        }
+    }
+
+    fn monthly_quota(used: u16, observed_minute: i64) -> UsageQuota {
+        UsageQuota {
+            source_app: SourceApp::Cursor,
+            label: Some("Cursor Models".to_string()),
+            window_minutes: BILLING_MONTH,
+            used_percent_tenths: used,
+            resets_at: Some(at(i64::from(BILLING_MONTH))),
+            observed_at: at(observed_minute),
+        }
+    }
+
+    #[test]
+    fn a_long_window_sampled_finely_still_fits_a_rate() {
+        // A month-long pool moves half a percentage point between stored
+        // readings — below what a single comparison can tell from rounding.
+        // Comparing only neighbours, every one of these is discarded and the
+        // window can never be fitted however long the app runs, which is
+        // exactly the window that most needs carrying forward.
+        let mut samples = Vec::new();
+        let mut records = Vec::new();
+        for step in 0..=12i64 {
+            samples.push(monthly_sample(step * 2, (step * 5) as u16));
+            if step > 0 {
+                records.push(record(
+                    SourceApp::Cursor,
+                    step * 2 - 1,
+                    "claude-4.6-opus",
+                    100_000,
+                    10_000,
+                ));
+            }
+        }
+
+        let fits = fit_calibrations(&[monthly_quota(60, 24)], &samples, &records);
+        assert_eq!(fits.len(), 1, "the monthly window earns a fit");
+        // Three spans of four readings each: every span accumulates the twenty
+        // tenths no single step ever reaches.
+        assert_eq!(fits[0].pairs, 3);
+        assert_eq!(fits[0].residual_percent, 0);
+        assert!(fits[0].is_trustworthy());
+    }
+
+    #[test]
+    fn spans_do_not_overlap_so_spend_is_counted_once() {
+        // Readings ten tenths apart: spans close every second one. Were they
+        // to overlap, the same records would be counted twice and the fitted
+        // rate would come out half what the data says.
+        let samples: Vec<QuotaSample> = (0..=6i64)
+            .map(|step| monthly_sample(step * 10, (step * 10) as u16))
+            .collect();
+        let records: Vec<UsageRecord> = (1..=6i64)
+            .map(|step| record(SourceApp::Cursor, step * 10 - 5, "claude-4.6-opus", 1_000, 100))
+            .collect();
+
+        let fits = fit_calibrations(&[monthly_quota(60, 60)], &samples, &records);
+        assert_eq!(fits.len(), 1);
+        assert_eq!(fits[0].pairs, 3);
+        // Twenty tenths per span, bought by two records' worth of spend.
+        let units = 2 * (1_000 * OPUS.input + 100 * OPUS.output);
+        assert_eq!(fits[0].tenths_for(units), 20);
     }
 
     #[test]
